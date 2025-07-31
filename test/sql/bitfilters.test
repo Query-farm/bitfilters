@@ -1,0 +1,23 @@
+# name: test/sql/bitfilters.test
+# description: test bitfilters extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT bitfilters('Sam');
+----
+Catalog Error: Scalar Function with name bitfilters does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require bitfilters
+
+# Confirm the extension works
+query I
+SELECT bitfilters('Sam');
+----
+Bitfilters Sam 🐥
+
+query I
+SELECT bitfilters_openssl_version('Michael') ILIKE 'Bitfilters Michael, my linked OpenSSL version is OpenSSL%';
+----
+true

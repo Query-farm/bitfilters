@@ -1,0 +1,14 @@
+vcpkg_from_github(
+    OUT_SOURCE_PATH SOURCE_PATH
+    REPO joaquintides/bloom
+    REF e578fe2274e60936119f89ce51512e8d9f1d7972
+    SHA512 62e1167bafea8d18950838df9766b517b4192529bac14d212aff9d9ba77416142da1dcb934a2b0e2648b25d9e93390de5b94d0e49a78a699093fe931be9d6cb9
+    HEAD_REF develop
+)
+
+set(VERSION 1.88.0)
+set(FEATURE_OPTIONS "")
+boost_configure_and_install(
+    SOURCE_PATH "${SOURCE_PATH}"
+    OPTIONS ${FEATURE_OPTIONS}
+)
