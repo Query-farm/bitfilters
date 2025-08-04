@@ -2,22 +2,40 @@
 # description: test bitfilters extension
 # group: [sql]
 
-# Before we load the extension, this will fail
-statement error
-SELECT bitfilters('Sam');
-----
-Catalog Error: Scalar Function with name bitfilters does not exist!
-
 # Require statement will ensure this test is run with this extension loaded
 require bitfilters
 
-# Confirm the extension works
-query I
-SELECT bitfilters('Sam');
-----
-Bitfilters Sam 🐥
+statement ok
+create table series_data as (select * as id from generate_series(1, 10000))
 
-query I
-SELECT bitfilters_openssl_version('Michael') ILIKE 'Bitfilters Michael, my linked OpenSSL version is OpenSSL%';
+statement ok
+create table bloom_filters as (
+  select id % 2 as remainder, bloomfilter(10000, 0.1, id) as filter
+  from series_data
+  group by id % 2
+);
+
+query II
+select remainder, count(case when bloomfilter_contains(filter, id) then 1 else null end) as is_contained
+from series_data, bloom_filters where series_data.id % 2 == bloom_filters.remainder group by remainder;
 ----
-true
+0	5000
+1	5000
+
+query II
+select remainder, count(case when bloomfilter_contains(filter, id) then 1 else null end) as false_positives
+from series_data, bloom_filters where series_data.id % 2 != bloom_filters.remainder group by remainder;
+----
+0	46
+1	41
+
+statement ok
+create table quotient_filters as (
+  select id % 2 as remainder, quotient_filter(12, 2, id::ubigint) as filter
+  from series_data
+  group by id % 2
+);
+
+
+select remainder, count(case when quotient_filter_contains(filter, id::ubigint) then 1 else null end) as is_contained
+from series_data, quotient_filters where series_data.id % 2 == quotient_filters.remainder group by remainder;

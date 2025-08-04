@@ -7,13 +7,14 @@
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include <boost/bloom/filter.hpp>
-#include "bloom_filter.hpp"
-
+#include "bitfilters_bloom_filter.hpp"
+#include "bitfilters_quotient_filter.hpp"
 namespace duckdb {
 
 static void LoadInternal(DatabaseInstance &instance) {
 	// Register Bloom filter functions
 	LoadBloomFilter(instance);
+	LoadQuotientFilter(instance);
 }
 
 void BitfiltersExtension::Load(DuckDB &db) {

@@ -167,6 +167,11 @@ struct BloomFilterOperationBase {
 		state.filter = nullptr;
 	}
 
+	template <class STATE>
+	static void Destroy(STATE &state, AggregateInputData &aggr_input_data) {
+		state.filter = nullptr;
+	}
+
 	static bool IgnoreNull() {
 		return true;
 	}
