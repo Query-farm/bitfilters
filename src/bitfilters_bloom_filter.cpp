@@ -361,7 +361,7 @@ void LoadBloomFilter(DatabaseInstance &instance) {
 
 	// Register scalar functions
 	{
-		ScalarFunctionSet fs("bloomfilter_contains");
+		ScalarFunctionSet fs("bloom_filter_contains");
 
 		// Register contains functions for all supported types
 		RegisterBloomFilterContainsForType<int8_t>(fs, LogicalType::TINYINT);
@@ -382,8 +382,8 @@ void LoadBloomFilter(DatabaseInstance &instance) {
 			desc.description = "Tests if a Bloom filter may contain a value. Returns true if the value "
 			                   "might be in the set (with possible false positives), or false if the value "
 			                   "is definitely not in the set (no false negatives).";
-			desc.examples.push_back("SELECT bloomfilter_contains(filter, 42) FROM table");
-			desc.examples.push_back("SELECT * FROM table WHERE bloomfilter_contains(precomputed_filter, id)");
+			desc.examples.push_back("SELECT bloom_filter_contains(filter, 42) FROM table");
+			desc.examples.push_back("SELECT * FROM table WHERE bloom_filter_contains(precomputed_filter, id)");
 			info.descriptions.push_back(desc);
 		}
 

@@ -16,14 +16,16 @@ create table bloom_filters as (
 );
 
 query II
-select remainder, count(case when bloomfilter_contains(filter, id) then 1 else null end) as is_contained
-from series_data, bloom_filters where series_data.id % 2 == bloom_filters.remainder group by remainder;
+select remainder,
+count(case when bloom_filter_contains(filter, id) then 1 else null end) as is_contained
+from series_data,
+bloom_filters where series_data.id % 2 == bloom_filters.remainder group by remainder;
 ----
 0	5000
 1	5000
 
 query II
-select remainder, count(case when bloomfilter_contains(filter, id) then 1 else null end) as false_positives
+select remainder, count(case when bloom_filter_contains(filter, id) then 1 else null end) as false_positives
 from series_data, bloom_filters where series_data.id % 2 != bloom_filters.remainder group by remainder;
 ----
 0	46
@@ -31,11 +33,15 @@ from series_data, bloom_filters where series_data.id % 2 != bloom_filters.remain
 
 statement ok
 create table quotient_filters as (
-  select id % 2 as remainder, quotient_filter(12, 2, id::ubigint) as filter
+  select id % 2 as remainder, quotient_filter(15, 1, hash(id)) as filter
   from series_data
   group by id % 2
 );
 
+query II
+select remainder, count(case when quotient_filter_contains(filter, hash(id)) then 1 else null end) as false_positives
+from series_data, quotient_filters where series_data.id % 2 != quotient_filters.remainder group by remainder;
+----
+0	341
+1	350
 
-select remainder, count(case when quotient_filter_contains(filter, id::ubigint) then 1 else null end) as is_contained
-from series_data, quotient_filters where series_data.id % 2 == quotient_filters.remainder group by remainder;

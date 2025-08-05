@@ -7,7 +7,7 @@ set(TARGET_NAME bitfilters)
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
 # Note that it should also be removed from vcpkg.json to prevent needlessly installing it..
 find_package(Boost REQUIRED COMPONENTS bloom)
-
+set(CMAKE_CXX_STANDARD 17)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
