@@ -57,7 +57,6 @@ WHERE filter_contains(pf.filter, lt.key)  -- Fast filter check
   AND complex_condition(lt.data);         -- Expensive check only when needed
 ```
 
-
 ## Available Filters
 
 ### 1. Quotient Filters
