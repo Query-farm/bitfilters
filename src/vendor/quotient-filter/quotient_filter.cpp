@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include "duckdb.hpp"
 
 #include "quotient_filter.hpp"
 
@@ -32,11 +33,11 @@ QuotientFilter::QuotientFilter(const std::string &data) {
 	// Deserialize the QuotientFilter from a string
 	memcpy(&values, data.data(), sizeof(QuotientFilterValues));
 	if (data.size() < sizeof(QuotientFilterValues)) {
-		throw std::invalid_argument("Data size is too small to contain QuotientFilterValues");
+		throw duckdb::IOException("Data size is too small to contain QuotientFilterValues");
 	}
 	size_t table_size = QuotientFilter::table_size(values);
 	if (data.size() < sizeof(QuotientFilterValues) + table_size) {
-		throw std::invalid_argument("Data size is too small to contain QuotientFilter table");
+		throw duckdb::IOException("Data size is too small to contain QuotientFilter table");
 	}
 	table.resize(table_size / sizeof(uint64_t));
 	memcpy(table.data(), data.data() + sizeof(QuotientFilterValues), table.size() * sizeof(uint64_t));
@@ -45,11 +46,11 @@ QuotientFilter::QuotientFilter(const std::string &data) {
 QuotientFilter::QuotientFilter(const char *data, size_t length) {
 	memcpy(&values, data, sizeof(QuotientFilterValues));
 	if (length < sizeof(QuotientFilterValues)) {
-		throw std::invalid_argument("Data size is too small to contain QuotientFilterValues");
+		throw duckdb::IOException("Data size is too small to contain QuotientFilterValues");
 	}
 	size_t table_size = QuotientFilter::table_size(values);
 	if (length < sizeof(QuotientFilterValues) + table_size) {
-		throw std::invalid_argument("Data size is too small to contain QuotientFilter table");
+		throw duckdb::IOException("Data size is too small to contain QuotientFilter table");
 	}
 	table.resize(table_size / sizeof(uint64_t));
 	memcpy(table.data(), data + sizeof(QuotientFilterValues), table.size() * sizeof(uint64_t));
