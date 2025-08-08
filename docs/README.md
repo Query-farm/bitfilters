@@ -28,25 +28,17 @@ For more information about DuckDB extensions, see the [official documentation](h
 Bitfilters are [probabilistic data structures](https://en.wikipedia.org/wiki/Probabilistic_data_structure) that provide fast, memory-efficient approximate set membership testing. They are designed to answer the question "Is element X in set S?" with:
 
 - **Space efficiency**: Use significantly less memory than storing the actual set
-
 - **Speed**: Extremely fast lookups (typically [O(1)](https://en.wikipedia.org/wiki/Big_O_notation) or O(k) where k is small)
-
 - **No false negatives**: If a filter says "NO", the element is definitely not in the set
-
 - **Possible false positives**: If a filter says "YES", the element might be in the set
 
 ### Common Use Cases
 
 - **Pre-filtering expensive operations**: Avoid costly disk I/O or network calls for non-existent data
-
 - **Duplicate detection**: Quickly identify potential duplicates in large datasets
-
 - **Cache optimization**: Determine if data might be in cache before expensive lookups
-
 - **Data skipping**: Skip irrelevant data partitions in analytical queries
-
 - **Set operations**: Approximate set intersections and unions on massive datasets
-
 - **Database join optimization**: Pre-filter join candidates to reduce computation
 
 ### Performance Benefits
