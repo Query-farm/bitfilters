@@ -6,6 +6,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 #include "quotient_filter.hpp"
 
@@ -18,15 +19,9 @@ QuotientFilter::QuotientFilter(const QuotientFilter &other) : values(other.value
 QuotientFilterValues::QuotientFilterValues(uint32_t q, uint32_t r)
     : qbits(q), rbits(r), elem_bits(r + 3), entries(0), index_mask(LOW_MASK(q)), rmask(LOW_MASK(r)),
       elem_mask(LOW_MASK(elem_bits)), max_size(1ULL << q) {
-	if (q == 0) {
-		throw std::invalid_argument("Quotient filter q must be > 0");
-	}
-	if (r == 0) {
-		throw std::invalid_argument("Quotient filter r must be > 0");
-	}
-	if (q + r > 64) {
-		throw std::invalid_argument("Quotient filter q+r must be between 0 and 64");
-	}
+	assert(q > 0);
+	assert(r > 0);
+	assert(q + r <= 64);
 }
 
 QuotientFilter::QuotientFilter(uint32_t q, uint32_t r) : values(q, r), table(QuotientFilter::table_size(q, r)) {
