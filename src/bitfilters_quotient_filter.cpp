@@ -253,7 +253,6 @@ static inline void QuotientFilterContains(DataChunk &args, ExpressionState &stat
 	auto &item_vector = args.data[1];
 
 	if (filter_vector.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-		printf("Doing constant fix\n");
 		auto state = QuotientFilterState<T>(ConstantVector::GetData<string_t>(filter_vector)[0]);
 		UnaryExecutor::Execute<T, bool>(item_vector, result, args.size(),
 		                                [&](T item_data) { return state.filter->may_contain(item_data); });
@@ -304,16 +303,6 @@ void LoadQuotientFilter(DatabaseInstance &instance) {
 	{
 		AggregateFunctionSet Quotientfilter("quotient_filter");
 
-		// Register functions for all supported types
-		// RegisterQuotientFilterFunctionsForType<int8_t>(Quotientfilter, LogicalType::TINYINT);
-		// RegisterQuotientFilterFunctionsForType<int16_t>(Quotientfilter, LogicalType::SMALLINT);
-		// RegisterQuotientFilterFunctionsForType<int32_t>(Quotientfilter, LogicalType::INTEGER);
-		// RegisterQuotientFilterFunctionsForType<int64_t>(Quotientfilter, LogicalType::BIGINT);
-		// RegisterQuotientFilterFunctionsForType<float>(Quotientfilter, LogicalType::FLOAT);
-		// RegisterQuotientFilterFunctionsForType<double>(Quotientfilter, LogicalType::DOUBLE);
-		// RegisterQuotientFilterFunctionsForType<uint8_t>(Quotientfilter, LogicalType::UTINYINT);
-		// RegisterQuotientFilterFunctionsForType<uint16_t>(Quotientfilter, LogicalType::USMALLINT);
-		// RegisterQuotientFilterFunctionsForType<uint32_t>(Quotientfilter, LogicalType::UINTEGER);
 		RegisterQuotientFilterFunctionsForType<uint64_t>(Quotientfilter, LogicalType::UBIGINT);
 
 		CreateAggregateFunctionInfo Quotientfilter_create_info(Quotientfilter);
@@ -333,16 +322,6 @@ void LoadQuotientFilter(DatabaseInstance &instance) {
 	{
 		ScalarFunctionSet fs("quotient_filter_contains");
 
-		// Register contains functions for all supported types
-		// RegisterQuotientFilterContainsForType<int8_t>(fs, LogicalType::TINYINT);
-		// RegisterQuotientFilterContainsForType<int16_t>(fs, LogicalType::SMALLINT);
-		// RegisterQuotientFilterContainsForType<int32_t>(fs, LogicalType::INTEGER);
-		// RegisterQuotientFilterContainsForType<int64_t>(fs, LogicalType::BIGINT);
-		// RegisterQuotientFilterContainsForType<float>(fs, LogicalType::FLOAT);
-		// RegisterQuotientFilterContainsForType<double>(fs, LogicalType::DOUBLE);
-		// RegisterQuotientFilterContainsForType<uint8_t>(fs, LogicalType::UTINYINT);
-		// RegisterQuotientFilterContainsForType<uint16_t>(fs, LogicalType::USMALLINT);
-		// RegisterQuotientFilterContainsForType<uint32_t>(fs, LogicalType::UINTEGER);
 		RegisterQuotientFilterContainsForType<uint64_t>(fs, LogicalType::UBIGINT);
 
 		CreateScalarFunctionInfo info(std::move(fs));

@@ -6,15 +6,18 @@
 #include "duckdb/main/extension_util.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
-#include <boost/bloom/filter.hpp>
-#include "bitfilters_bloom_filter.hpp"
+// #include "bitfilters_bloom_filter.hpp"
 #include "bitfilters_quotient_filter.hpp"
+#include "bitfilters_xor_filter.hpp"
+#include "bitfilters_binary_fuse_filter.hpp"
 namespace duckdb {
 
 static void LoadInternal(DatabaseInstance &instance) {
 	// Register Bloom filter functions
-	LoadBloomFilter(instance);
+	//	LoadBloomFilter(instance);
 	LoadQuotientFilter(instance);
+	LoadXorFilter(instance);
+	LoadBinaryFuseFilter(instance);
 }
 
 void BitfiltersExtension::Load(DuckDB &db) {
