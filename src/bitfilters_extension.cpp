@@ -3,7 +3,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 // #include "bitfilters_bloom_filter.hpp"
@@ -12,16 +11,16 @@
 #include "bitfilters_binary_fuse_filter.hpp"
 namespace duckdb {
 
-static void LoadInternal(DatabaseInstance &instance) {
+static void LoadInternal(ExtensionLoader &loader) {
 	// Register Bloom filter functions
 	//	LoadBloomFilter(instance);
-	LoadQuotientFilter(instance);
-	LoadXorFilter(instance);
-	LoadBinaryFuseFilter(instance);
+	LoadQuotientFilter(loader);
+	LoadXorFilter(loader);
+	LoadBinaryFuseFilter(loader);
 }
 
-void BitfiltersExtension::Load(DuckDB &db) {
-	LoadInternal(*db.instance);
+void BitfiltersExtension::Load(ExtensionLoader &loader) {
+	LoadInternal(loader);
 }
 std::string BitfiltersExtension::Name() {
 	return "bitfilters";
@@ -35,12 +34,7 @@ std::string BitfiltersExtension::Version() const {
 
 extern "C" {
 
-DUCKDB_EXTENSION_API void bitfilters_init(duckdb::DatabaseInstance &db) {
-	duckdb::DuckDB db_wrapper(db);
-	db_wrapper.LoadExtension<duckdb::BitfiltersExtension>();
-}
-
-DUCKDB_EXTENSION_API const char *bitfilters_version() {
-	return duckdb::DuckDB::LibraryVersion();
+DUCKDB_CPP_EXTENSION_ENTRY(bitfilters, loader) {
+	duckdb::LoadInternal(loader);
 }
 }

@@ -2,6 +2,6 @@
 #include "duckdb.hpp"
 
 namespace duckdb {
-void LoadBloomFilter(DatabaseInstance &instance);
+void LoadBloomFilter(ExtensionLoader &loader);
 
 }

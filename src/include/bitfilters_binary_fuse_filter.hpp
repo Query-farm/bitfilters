@@ -2,6 +2,6 @@
 #include "duckdb.hpp"
 
 namespace duckdb {
-void LoadBinaryFuseFilter(DatabaseInstance &instance);
+void LoadBinaryFuseFilter(ExtensionLoader &loader);
 
 }

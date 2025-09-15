@@ -2,6 +2,6 @@
 #include "duckdb.hpp"
 
 namespace duckdb {
-void LoadQuotientFilter(DatabaseInstance &instance);
+void LoadQuotientFilter(ExtensionLoader &loader);
 
 }

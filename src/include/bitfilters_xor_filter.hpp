@@ -2,6 +2,6 @@
 #include "duckdb.hpp"
 
 namespace duckdb {
-void LoadXorFilter(DatabaseInstance &instance);
+void LoadXorFilter(ExtensionLoader &loader);
 
 }

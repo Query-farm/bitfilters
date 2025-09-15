@@ -3,7 +3,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "vendor/fastfilter/xorfilter.h"
@@ -263,10 +262,7 @@ static void RegisterXorFilterContainsForType(ScalarFunctionSet &fs, const Logica
 }
 } // namespace
 
-void LoadXorFilter(DatabaseInstance &instance) {
-	auto &system_catalog = Catalog::GetSystemCatalog(instance);
-	auto data = CatalogTransaction::GetSystemTransaction(instance);
-
+void LoadXorFilter(ExtensionLoader &loader) {
 	// Register aggregate functions
 	{
 		AggregateFunctionSet Xorfilter("xor16_filter");
@@ -278,7 +274,7 @@ void LoadXorFilter(DatabaseInstance &instance) {
 			desc.examples.push_back("SELECT xor_filter(16, 8, column) FROM table");
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
-		system_catalog.CreateFunction(data, Xorfilter_create_info);
+		loader.RegisterFunction(Xorfilter_create_info);
 	}
 
 	{
@@ -291,7 +287,7 @@ void LoadXorFilter(DatabaseInstance &instance) {
 			desc.examples.push_back("SELECT xor_filter(16, 8, column) FROM table");
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
-		system_catalog.CreateFunction(data, Xorfilter_create_info);
+		loader.RegisterFunction(Xorfilter_create_info);
 	}
 
 	// Register scalar functions
@@ -307,7 +303,7 @@ void LoadXorFilter(DatabaseInstance &instance) {
 			desc.examples.push_back("SELECT xor16_filter_contains(filter, 42) FROM table");
 			info.descriptions.push_back(desc);
 		}
-		system_catalog.CreateFunction(data, info);
+		loader.RegisterFunction(info);
 	}
 
 	{
@@ -322,7 +318,7 @@ void LoadXorFilter(DatabaseInstance &instance) {
 			desc.examples.push_back("SELECT xor8_filter_contains(filter, 42) FROM table");
 			info.descriptions.push_back(desc);
 		}
-		system_catalog.CreateFunction(data, info);
+		loader.RegisterFunction(info);
 	}
 }
 

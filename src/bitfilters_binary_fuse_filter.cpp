@@ -3,7 +3,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "vendor/fastfilter/binaryfusefilter.h"
@@ -265,10 +264,7 @@ static void RegisterBinaryFuseFilterContainsForType(ScalarFunctionSet &fs, const
 }
 } // namespace
 
-void LoadBinaryFuseFilter(DatabaseInstance &instance) {
-	auto &system_catalog = Catalog::GetSystemCatalog(instance);
-	auto data = CatalogTransaction::GetSystemTransaction(instance);
-
+void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 	// Register aggregate functions
 	{
 		AggregateFunctionSet BinaryFusefilter("binary_fuse16_filter");
@@ -280,7 +276,7 @@ void LoadBinaryFuseFilter(DatabaseInstance &instance) {
 			desc.examples.push_back("SELECT xor_filter(16, 8, column) FROM table");
 			BinaryFusefilter_create_info.descriptions.push_back(desc);
 		}
-		system_catalog.CreateFunction(data, BinaryFusefilter_create_info);
+		loader.RegisterFunction(BinaryFusefilter_create_info);
 	}
 
 	{
@@ -293,7 +289,7 @@ void LoadBinaryFuseFilter(DatabaseInstance &instance) {
 			desc.examples.push_back("SELECT xor_filter(16, 8, column) FROM table");
 			BinaryFusefilter_create_info.descriptions.push_back(desc);
 		}
-		system_catalog.CreateFunction(data, BinaryFusefilter_create_info);
+		loader.RegisterFunction(BinaryFusefilter_create_info);
 	}
 
 	// Register scalar functions
@@ -309,7 +305,7 @@ void LoadBinaryFuseFilter(DatabaseInstance &instance) {
 			desc.examples.push_back("SELECT binary_fuse16_filter_contains(filter, 42) FROM table");
 			info.descriptions.push_back(desc);
 		}
-		system_catalog.CreateFunction(data, info);
+		loader.RegisterFunction(info);
 	}
 
 	{
@@ -324,7 +320,7 @@ void LoadBinaryFuseFilter(DatabaseInstance &instance) {
 			desc.examples.push_back("SELECT binary_fuse8_filter_contains(filter, 42) FROM table");
 			info.descriptions.push_back(desc);
 		}
-		system_catalog.CreateFunction(data, info);
+		loader.RegisterFunction(info);
 	}
 }
 

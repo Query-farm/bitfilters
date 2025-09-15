@@ -3,7 +3,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "vendor/quotient-filter/quotient_filter.hpp"
@@ -295,9 +294,7 @@ static void RegisterQuotientFilterContainsForType(ScalarFunctionSet &fs, const L
 }
 } // namespace
 
-void LoadQuotientFilter(DatabaseInstance &instance) {
-	auto &system_catalog = Catalog::GetSystemCatalog(instance);
-	auto data = CatalogTransaction::GetSystemTransaction(instance);
+void LoadQuotientFilter(ExtensionLoader &loader) {
 
 	// Register aggregate functions
 	{
@@ -315,7 +312,7 @@ void LoadQuotientFilter(DatabaseInstance &instance) {
 			Quotientfilter_create_info.descriptions.push_back(desc);
 		}
 
-		system_catalog.CreateFunction(data, Quotientfilter_create_info);
+		loader.RegisterFunction(Quotientfilter_create_info);
 	}
 
 	// Register scalar functions
@@ -335,7 +332,7 @@ void LoadQuotientFilter(DatabaseInstance &instance) {
 			info.descriptions.push_back(desc);
 		}
 
-		system_catalog.CreateFunction(data, info);
+		loader.RegisterFunction(info);
 	}
 }
 
