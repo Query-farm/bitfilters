@@ -295,7 +295,6 @@ static void RegisterQuotientFilterContainsForType(ScalarFunctionSet &fs, const L
 } // namespace
 
 void LoadQuotientFilter(ExtensionLoader &loader) {
-
 	// Register aggregate functions
 	{
 		AggregateFunctionSet Quotientfilter("quotient_filter");
