@@ -9,6 +9,7 @@
 #include "bitfilters_quotient_filter.hpp"
 #include "bitfilters_xor_filter.hpp"
 #include "bitfilters_binary_fuse_filter.hpp"
+#include "query_farm_telemetry.hpp"
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -17,6 +18,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	LoadQuotientFilter(loader);
 	LoadXorFilter(loader);
 	LoadBinaryFuseFilter(loader);
+
+	QueryFarmSendTelemetry(loader, "bitfilters", BitfiltersExtension().Version());
 }
 
 void BitfiltersExtension::Load(ExtensionLoader &loader) {
@@ -27,7 +30,7 @@ std::string BitfiltersExtension::Name() {
 }
 
 std::string BitfiltersExtension::Version() const {
-	return "0.0.1";
+	return "2025091501";
 }
 
 } // namespace duckdb
