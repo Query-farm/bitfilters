@@ -39,7 +39,6 @@ struct XorFilterState {
 
 	explicit XorFilterState(const string_t &data) {
 		entries = make_uniq<std::vector<uint64_t>>();
-		entries->reserve(STANDARD_VECTOR_SIZE); // Reserve space to avoid reallocations
 	}
 };
 
@@ -129,7 +128,6 @@ struct XorFilterCreateOperation {
 	static void Operation(STATE &state, const A_TYPE &a_data, AggregateUnaryInput &) {
 		if (!state.entries) {
 			state.entries = make_uniq<std::vector<uint64_t>>();
-			state.entries->reserve(STANDARD_VECTOR_SIZE);
 		}
 		state.entries->push_back(a_data);
 	}
