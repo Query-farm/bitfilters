@@ -270,8 +270,8 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo BinaryFusefilter_create_info(BinaryFusefilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a BinaryFuse16 filter.";
-			desc.examples.push_back("SELECT xor_filter(16, 8, column) FROM table");
+			desc.description = "Creates a Binary Fuse 16-bit filter with ~0.0015% false positive rate.";
+			desc.examples.push_back("SELECT binary_fuse16_filter(hash(column)) FROM table");
 			BinaryFusefilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(BinaryFusefilter_create_info);
@@ -283,8 +283,8 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo BinaryFusefilter_create_info(BinaryFusefilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a BinaryFuse16 filter.";
-			desc.examples.push_back("SELECT xor_filter(16, 8, column) FROM table");
+			desc.description = "Creates a Binary Fuse 8-bit filter with ~0.4% false positive rate.";
+			desc.examples.push_back("SELECT binary_fuse8_filter(hash(column)) FROM table");
 			BinaryFusefilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(BinaryFusefilter_create_info);
