@@ -268,8 +268,8 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo Xorfilter_create_info(Xorfilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Xor16 filter.";
-			desc.examples.push_back("SELECT xor_filter(16, 8, column) FROM table");
+			desc.description = "Creates a Xor16 filter with ~0.0015% false positive rate.";
+			desc.examples.push_back("SELECT xor16_filter(hash(column)) FROM table");
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(Xorfilter_create_info);
@@ -281,8 +281,8 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo Xorfilter_create_info(Xorfilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Xor16 filter.";
-			desc.examples.push_back("SELECT xor_filter(16, 8, column) FROM table");
+			desc.description = "Creates a Xor8 filter with ~0.4% false positive rate.";
+			desc.examples.push_back("SELECT xor8_filter(hash(column)) FROM table");
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(Xorfilter_create_info);
