@@ -159,6 +159,49 @@ SELECT
 FROM binary_fuse_filters WHERE remainder = 1;
 ```
 
+### 4. DuckDB Bloom Filter Functions
+
+Version-aware functions for working with DuckDB's internal bloom filters. These enable remote systems to hash values and probe bloom filters using the exact algorithm DuckDB uses for hash join optimization.
+
+#### Functions:
+
+- `bitfilters_duckdb_hash(version, value, ...)` - Compute DuckDB-internal hash for a specific version
+- `bitfilters_duckdb_bloom_filter_create(version, num_sectors, hash_value)` - Build a DuckDB-compatible bloom filter
+- `bitfilters_duckdb_bloom_filter_probe(version, filter, value, ...)` - Probe a bloom filter for membership
+
+#### Characteristics:
+
+- **Use case**: Remote bloom filter pushdown (e.g., VGI extension), cross-version hash compatibility
+- **Supported versions**: v1.4.0–v1.4.4, v1.5.0, v1.5.1, v1.6.0
+- **Hash algorithm**: MurmurHash64 with CombineHash for multi-key support
+- **Filter format**: `[uint64 num_sectors][uint64 sectors...]` — num_sectors must be a power of 2
+
+```sql
+-- Hash a single value (matches DuckDB's built-in hash() for that version)
+SELECT bitfilters_duckdb_hash('v1.5.1', 42);
+
+-- Hash multiple values (matches DuckDB's variadic hash() with CombineHash)
+SELECT bitfilters_duckdb_hash('v1.5.1', col1, col2) FROM my_table;
+
+-- Build a bloom filter from a table's keys
+CREATE TABLE my_filter AS
+SELECT bitfilters_duckdb_bloom_filter_create('v1.5.1', 16384,
+    bitfilters_duckdb_hash('v1.5.1', key_col)) AS filter
+FROM build_side;
+
+-- Probe the bloom filter against another table
+SELECT * FROM probe_side
+WHERE bitfilters_duckdb_bloom_filter_probe('v1.5.1',
+    (SELECT filter FROM my_filter), key_col);
+
+-- Multi-key bloom filter (composite join keys)
+SELECT bitfilters_duckdb_bloom_filter_create('v1.5.1', 8192,
+    bitfilters_duckdb_hash('v1.5.1', col1, col2)) AS filter
+FROM build_side;
+```
+
+The version parameter and filter blob are constant-folded at bind time for optimal performance. An unsupported version raises an error.
+
 ## Usage Examples
 
 ### Basic Filter Operations
@@ -542,6 +585,53 @@ Tests if a Binary Fuse filter may contain a hash value.
 ##### Returns:
 
 `BOOLEAN` (same semantics as other filters)
+
+### DuckDB Bloom Filter Functions
+
+#### `bitfilters_duckdb_hash(version, value, ...)`
+
+Computes the DuckDB-internal hash value for a specific DuckDB version. Multiple values are combined using the version's CombineHash algorithm. Matches the output of DuckDB's built-in `hash()` function for that version.
+
+##### Parameters:
+
+- `version` (VARCHAR, constant): DuckDB version string (e.g., `'v1.5.1'`)
+- `value` (ANY, variadic): One or more values to hash
+
+##### Returns:
+
+`UBIGINT` — the hash value
+
+---
+
+#### `bitfilters_duckdb_bloom_filter_create(version, num_sectors, hash_value)`
+
+Aggregate function that builds a DuckDB-compatible bloom filter from pre-hashed `UBIGINT` values. Use `bitfilters_duckdb_hash()` to hash values first.
+
+##### Parameters:
+
+- `version` (VARCHAR, constant): DuckDB version string
+- `num_sectors` (INTEGER, constant): Number of 64-bit sectors (must be power of 2)
+- `hash_value` (UBIGINT): Pre-hashed values from `bitfilters_duckdb_hash()`
+
+##### Returns:
+
+`BLOB` — serialized bloom filter (`[uint64 num_sectors][uint64 sectors...]`)
+
+---
+
+#### `bitfilters_duckdb_bloom_filter_probe(version, filter, value, ...)`
+
+Probes a DuckDB-compatible bloom filter for set membership. The version and filter blob are constant-folded at bind time.
+
+##### Parameters:
+
+- `version` (VARCHAR, constant): DuckDB version string
+- `filter` (BLOB): Serialized bloom filter from `bitfilters_duckdb_bloom_filter_create()`
+- `value` (ANY, variadic): One or more values to probe (hashed internally using the version's algorithm)
+
+##### Returns:
+
+`BOOLEAN` — `true` if the value might be in the set (possible false positive), `false` if definitely not
 
 ### Filter Characteristics Summary
 
