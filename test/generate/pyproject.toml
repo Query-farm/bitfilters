@@ -1,0 +1,7 @@
+[project]
+name = "bitfilters-test-gen"
+version = "0.1.0"
+requires-python = ">=3.11"
+# No default duckdb dependency — each venv pins a specific version
+
+[tool.uv.sources]
