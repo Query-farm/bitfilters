@@ -490,12 +490,14 @@ struct DuckDbBloomFilterCreateBindData : public FunctionData {
 };
 
 struct DuckDbBloomFilterCreateState {
-	unique_ptr<uint64_t[]> sectors;
-	uint64_t num_sectors = 0;
+	// Raw pointer — aggregate states live in uninitialized memory, so we cannot
+	// use unique_ptr (its operator= would try to delete a garbage pointer).
+	uint64_t *sectors;
+	uint64_t num_sectors;
 
-	void Initialize(uint64_t n) {
+	void Init(uint64_t n) {
 		num_sectors = n;
-		sectors = unique_ptr<uint64_t[]>(new uint64_t[n]());
+		sectors = new uint64_t[n]();
 	}
 
 	void Insert(uint64_t hash) {
@@ -509,15 +511,15 @@ struct DuckDbBloomFilterCreateState {
 		auto total_bytes = (num_sectors + 1) * sizeof(uint64_t);
 		result.resize(total_bytes);
 		memcpy(result.data(), &num_sectors, sizeof(uint64_t));
-		memcpy(result.data() + sizeof(uint64_t), sectors.get(), num_sectors * sizeof(uint64_t));
+		memcpy(result.data() + sizeof(uint64_t), sectors, num_sectors * sizeof(uint64_t));
 		return result;
 	}
 
 	void Merge(const DuckDbBloomFilterCreateState &other) {
 		if (!sectors) {
 			num_sectors = other.num_sectors;
-			sectors = unique_ptr<uint64_t[]>(new uint64_t[num_sectors]);
-			memcpy(sectors.get(), other.sectors.get(), num_sectors * sizeof(uint64_t));
+			sectors = new uint64_t[num_sectors];
+			memcpy(sectors, other.sectors, num_sectors * sizeof(uint64_t));
 		} else {
 			D_ASSERT(num_sectors == other.num_sectors);
 			for (uint64_t i = 0; i < num_sectors; i++) {
@@ -536,6 +538,7 @@ struct DuckDbBloomFilterCreateOperation {
 
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
+		delete[] state.sectors;
 		state.sectors = nullptr;
 	}
 
@@ -547,7 +550,7 @@ struct DuckDbBloomFilterCreateOperation {
 	static void Operation(STATE &state, const A_TYPE &input, AggregateUnaryInput &agg_input) {
 		if (!state.sectors) {
 			auto &bind_data = agg_input.input.bind_data->Cast<DuckDbBloomFilterCreateBindData>();
-			state.Initialize(bind_data.num_sectors);
+			state.Init(bind_data.num_sectors);
 		}
 		// Input is a pre-hashed UBIGINT value from bitfilters_duckdb_hash()
 		state.Insert(static_cast<uint64_t>(input));
