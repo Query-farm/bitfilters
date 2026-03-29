@@ -6,6 +6,7 @@
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 // #include "bitfilters_bloom_filter.hpp"
+#include "bitfilters_duckdb_bloom_filter.hpp"
 #include "bitfilters_quotient_filter.hpp"
 #include "bitfilters_xor_filter.hpp"
 #include "bitfilters_binary_fuse_filter.hpp"
@@ -18,6 +19,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	LoadQuotientFilter(loader);
 	LoadXorFilter(loader);
 	LoadBinaryFuseFilter(loader);
+	LoadDuckDbBloomFilter(loader);
 
 	QueryFarmSendTelemetry(loader, "bitfilters", BitfiltersExtension().Version());
 }
