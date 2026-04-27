@@ -268,8 +268,12 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo Xorfilter_create_info(Xorfilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Xor16 filter with ~0.0015% false positive rate.";
+			desc.description = "Creates an Xor16 filter (16-bit fingerprints, ~0.0015% false positive rate) "
+			                   "by aggregating UBIGINT values. Returns a BLOB to probe with xor16_filter_contains.";
+			desc.parameter_names = {"value"};
+			desc.parameter_types = {LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT xor16_filter(hash(column)) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(Xorfilter_create_info);
@@ -281,8 +285,12 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo Xorfilter_create_info(Xorfilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Xor8 filter with ~0.4% false positive rate.";
+			desc.description = "Creates an Xor8 filter (8-bit fingerprints, ~0.4% false positive rate) "
+			                   "by aggregating UBIGINT values. Returns a BLOB to probe with xor8_filter_contains.";
+			desc.parameter_names = {"value"};
+			desc.parameter_types = {LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT xor8_filter(hash(column)) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(Xorfilter_create_info);
@@ -295,10 +303,13 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateScalarFunctionInfo info(std::move(fs));
 		{
 			FunctionDescription desc;
-			desc.description = "Tests if a Xor16 filter may contain a value. Returns true if the value "
+			desc.description = "Tests if an Xor16 filter may contain a value. Returns true if the value "
 			                   "might be in the set (with possible false positives), or false if the value "
 			                   "is definitely not in the set (no false negatives).";
+			desc.parameter_names = {"filter", "value"};
+			desc.parameter_types = {LogicalType::BLOB, LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT xor16_filter_contains(filter, 42) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(info);
@@ -310,10 +321,13 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateScalarFunctionInfo info(std::move(fs));
 		{
 			FunctionDescription desc;
-			desc.description = "Tests if a Xor8 filter may contain a value. Returns true if the value "
+			desc.description = "Tests if an Xor8 filter may contain a value. Returns true if the value "
 			                   "might be in the set (with possible false positives), or false if the value "
 			                   "is definitely not in the set (no false negatives).";
+			desc.parameter_names = {"filter", "value"};
+			desc.parameter_types = {LogicalType::BLOB, LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT xor8_filter_contains(filter, 42) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(info);

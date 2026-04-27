@@ -270,8 +270,12 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo BinaryFusefilter_create_info(BinaryFusefilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Binary Fuse 16-bit filter with ~0.0015% false positive rate.";
+			desc.description = "Creates a Binary Fuse 16-bit filter (~0.0015% false positive rate) by aggregating "
+			                   "UBIGINT values. Returns a BLOB to probe with binary_fuse16_filter_contains.";
+			desc.parameter_names = {"value"};
+			desc.parameter_types = {LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT binary_fuse16_filter(hash(column)) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			BinaryFusefilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(BinaryFusefilter_create_info);
@@ -283,8 +287,12 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo BinaryFusefilter_create_info(BinaryFusefilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Binary Fuse 8-bit filter with ~0.4% false positive rate.";
+			desc.description = "Creates a Binary Fuse 8-bit filter (~0.4% false positive rate) by aggregating "
+			                   "UBIGINT values. Returns a BLOB to probe with binary_fuse8_filter_contains.";
+			desc.parameter_names = {"value"};
+			desc.parameter_types = {LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT binary_fuse8_filter(hash(column)) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			BinaryFusefilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(BinaryFusefilter_create_info);
@@ -297,10 +305,13 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 		CreateScalarFunctionInfo info(std::move(fs));
 		{
 			FunctionDescription desc;
-			desc.description = "Tests if a BinaryFuse16 filter may contain a value. Returns true if the value "
+			desc.description = "Tests if a Binary Fuse 16-bit filter may contain a value. Returns true if the value "
 			                   "might be in the set (with possible false positives), or false if the value "
 			                   "is definitely not in the set (no false negatives).";
+			desc.parameter_names = {"filter", "value"};
+			desc.parameter_types = {LogicalType::BLOB, LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT binary_fuse16_filter_contains(filter, 42) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(info);
@@ -312,10 +323,13 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 		CreateScalarFunctionInfo info(std::move(fs));
 		{
 			FunctionDescription desc;
-			desc.description = "Tests if a BinaryFuse8 filter may contain a value. Returns true if the value "
+			desc.description = "Tests if a Binary Fuse 8-bit filter may contain a value. Returns true if the value "
 			                   "might be in the set (with possible false positives), or false if the value "
 			                   "is definitely not in the set (no false negatives).";
+			desc.parameter_names = {"filter", "value"};
+			desc.parameter_types = {LogicalType::BLOB, LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT binary_fuse8_filter_contains(filter, 42) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(info);

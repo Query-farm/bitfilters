@@ -306,8 +306,12 @@ void LoadQuotientFilter(ExtensionLoader &loader) {
 		{
 			FunctionDescription desc;
 			desc.description = "Creates a Quotient filter by aggregating values or by merging other Quotient filters. "
-			                   "Takes q and r as number of bits.";
+			                   "q is the number of quotient bits (controls capacity, ~2^q slots) and r is the number "
+			                   "of remainder bits (controls false positive rate, ~2^-r). q + r must be <= 64.";
+			desc.parameter_names = {"q", "r", "value"};
+			desc.parameter_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT quotient_filter(16, 8, column) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			Quotientfilter_create_info.descriptions.push_back(desc);
 		}
 
@@ -327,7 +331,10 @@ void LoadQuotientFilter(ExtensionLoader &loader) {
 			desc.description = "Tests if a Quotient filter may contain a value. Returns true if the value "
 			                   "might be in the set (with possible false positives), or false if the value "
 			                   "is definitely not in the set (no false negatives).";
+			desc.parameter_names = {"filter", "value"};
+			desc.parameter_types = {LogicalType::BLOB, LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT quotient_filter_contains(filter, 42) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
 
