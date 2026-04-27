@@ -644,9 +644,13 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		FunctionDescription desc;
 		desc.description = "Computes the DuckDB-internal hash value for the given DuckDB version. "
 		                   "The hash matches DuckDB's built-in hash() function for that version. "
-		                   "Multiple values are combined using the version's CombineHash algorithm.";
+		                   "Multiple values are combined using the version's CombineHash algorithm. "
+		                   "Supported versions: v1.4.0-v1.4.4, v1.5.0, v1.5.1, v1.6.0.";
+		desc.parameter_names = {"version", "value"};
+		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::ANY};
 		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v1.5.1', 42)");
 		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v1.5.1', col1, col2) FROM tbl");
+		desc.categories = {"bitfilters", "hash"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(info);
 	}
@@ -665,10 +669,13 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		                   "The version parameter specifies which DuckDB hash algorithm to use. "
 		                   "The filter blob and version are constant-folded at bind time. "
 		                   "Multiple value arguments are combined for multi-key bloom filter probes.";
+		desc.parameter_names = {"version", "filter_blob", "value"};
+		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY};
 		desc.examples.push_back(
 		    "SELECT bitfilters_duckdb_bloom_filter_probe('v1.5.1', filter_blob, key_col) FROM tbl");
 		desc.examples.push_back(
 		    "SELECT bitfilters_duckdb_bloom_filter_probe('v1.5.1', filter_blob, col1, col2) FROM tbl");
+		desc.categories = {"bitfilters", "probabilistic"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(info);
 	}
@@ -690,8 +697,11 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		                   "Use bitfilters_duckdb_hash() to hash values first. "
 		                   "The version and num_sectors (power of 2) are constants. "
 		                   "Returns a BLOB that can be probed with bitfilters_duckdb_bloom_filter_probe.";
+		desc.parameter_names = {"version", "num_sectors", "hashed_value"};
+		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::UBIGINT};
 		desc.examples.push_back(
 		    "SELECT bitfilters_duckdb_bloom_filter_create('v1.5.1', 16384, bitfilters_duckdb_hash('v1.5.1', key)) FROM tbl");
+		desc.categories = {"bitfilters", "probabilistic"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(info);
 	}
