@@ -32,7 +32,7 @@ std::string BitfiltersExtension::Name() {
 }
 
 std::string BitfiltersExtension::Version() const {
-	return "2025091501";
+	return "2026072501";
 }
 
 } // namespace duckdb
