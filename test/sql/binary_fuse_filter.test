@@ -178,9 +178,18 @@ from half_dups, (select binary_fuse8_filter(distinct k) as f8, binary_fuse16_fil
 ----
 true	true
 
+# Members are always found; non-members are only *probably* absent, so probe a
+# whole batch of them and bound the false positive rate instead of asserting
+# that one particular non-member misses. binary_fuse8 sits around 1/256, so 50
+# of 500 is a wide margin that still catches a filter that has gone useless.
 query I
-select binary_fuse8_filter_contains(f8, hash(2)) and not binary_fuse8_filter_contains(f8, hash(1))
-from (select binary_fuse8_filter(hash(i)) filter (where i % 2 = 0) as f8 from range(1000) t(i));
+select bool_and(member_hit) and count(*) filter (where non_member_hit) < 50
+from (
+  select binary_fuse8_filter_contains(fb.f8, hash(2))   as member_hit,
+         binary_fuse8_filter_contains(fb.f8, hash(p.i)) as non_member_hit
+  from (select binary_fuse8_filter(hash(i)) filter (where i % 2 = 0) as f8
+        from range(1000) t(i)) fb,
+       range(1001, 2001, 2) p(i));
 ----
 true
 
