@@ -1,7 +1,9 @@
 #include "bitfilters_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
@@ -43,7 +45,6 @@ struct QuotientFilterBindData : public FunctionData {
 
 unique_ptr<FunctionData> QuotientFilterBind(ClientContext &context, AggregateFunction &function,
                                             vector<unique_ptr<Expression>> &arguments) {
-
 	if (arguments.size() == 1) {
 		return nullptr;
 	}
@@ -80,8 +81,22 @@ unique_ptr<FunctionData> QuotientFilterBind(ClientContext &context, AggregateFun
 	// FIXME: should check the type
 	r.CastAs(context, LogicalType::UINTEGER);
 	auto actual_r = r.GetValue<uint32_t>();
+	if (actual_r == 0) {
+		throw BinderException("Quotient filter r must be greater than 0");
+	}
 	if (actual_r + actual_q > 64) {
 		throw BinderException("Quotient filter q+r must be between 0 and 64");
+	}
+
+	// A filter this big can never be returned: DuckDB BLOBs top out at 4GB. Fail
+	// here rather than letting the aggregate allocate a table of that size and
+	// take the process down with it.
+	const uint64_t filter_bytes =
+	    sizeof(QuotientFilterValues) + (((1ULL << actual_q) * (uint64_t)(actual_r + 3)) + 7) / 8;
+	if (filter_bytes > NumericLimits<uint32_t>::Maximum()) {
+		throw BinderException("Quotient filter with q = %u and r = %u would need %llu bytes, which exceeds the maximum "
+		                      "BLOB size of %u bytes; use a smaller q",
+		                      actual_q, actual_r, filter_bytes, NumericLimits<uint32_t>::Maximum());
 	}
 
 	// So doing this causes problems.
@@ -93,27 +108,20 @@ unique_ptr<FunctionData> QuotientFilterBind(ClientContext &context, AggregateFun
 
 template <class T>
 struct QuotientFilterState {
-
-	std::unique_ptr<QuotientFilter> filter = nullptr;
-
-	QuotientFilterState() = delete;
-
-	explicit QuotientFilterState(const string_t &data) {
-		filter = make_uniq<QuotientFilter>(data.GetDataUnsafe(), data.GetSize());
-	}
-
-	explicit QuotientFilterState(const std::string &data) {
-		filter = make_uniq<QuotientFilter>(data);
-	}
+	// Raw pointer rather than unique_ptr: aggregate states are handed to us as
+	// uninitialized memory, so a smart pointer's assignment operator would run
+	// over (and try to free) a garbage pointer.
+	QuotientFilter *filter;
 
 	void CreateFilter(uint32_t q, uint32_t r) {
 		D_ASSERT(!filter);
-		filter = make_uniq<QuotientFilter>(q, r);
+		filter = new QuotientFilter(q, r);
 	}
 
 	void CreateFilter(const QuotientFilterState &existing) {
+		D_ASSERT(!filter);
 		if (existing.filter) {
-			filter = make_uniq<QuotientFilter>(*existing.filter);
+			filter = new QuotientFilter(*existing.filter);
 		}
 	}
 
@@ -126,7 +134,6 @@ struct QuotientFilterState {
 struct QuotientFilterOperationBase {
 	template <class STATE>
 	static void Initialize(STATE &state) {
-		state.filter.release();
 		state.filter = nullptr;
 	}
 
@@ -136,15 +143,28 @@ struct QuotientFilterOperationBase {
 
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &aggr_input_data) {
-		if (state.filter) {
-			state.filter = nullptr;
+		delete state.filter;
+		state.filter = nullptr;
+	}
+
+	// Merging a partial state into another. Either side can still be empty: a
+	// thread that saw no rows for a group never allocates a filter, and
+	// dereferencing that was a null deref.
+	template <class STATE>
+	static void CombineStates(const STATE &source, STATE &target) {
+		if (!source.filter) {
+			return;
+		}
+		if (!target.filter) {
+			target.CreateFilter(source);
+		} else {
+			*target.filter = target.filter->merge(*source.filter);
 		}
 	}
 };
 
 template <class BIND_DATA_TYPE>
 struct QuotientFilterMergeOperation : QuotientFilterOperationBase {
-
 	template <class A_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const A_TYPE &a_data, AggregateUnaryInput &idata) {
 		if (!state.filter) {
@@ -152,8 +172,10 @@ struct QuotientFilterMergeOperation : QuotientFilterOperationBase {
 			state.CreateFilter(bind_data.q, bind_data.r);
 		}
 
-		// this is a filter in b_data, so we need to deserialize it.
-		*state.filter = state.filter->merge(*(STATE(a_data.GetString()).filter));
+		// this is a filter in b_data, so we need to deserialize it. The
+		// constructor validates the BLOB and throws if it is not one of ours.
+		QuotientFilter incoming(a_data.GetData(), a_data.GetSize());
+		*state.filter = state.filter->merge(incoming);
 	}
 
 	template <class INPUT_TYPE, class STATE, class OP>
@@ -166,11 +188,7 @@ struct QuotientFilterMergeOperation : QuotientFilterOperationBase {
 
 	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &aggr_input_data) {
-		if (!target.filter) {
-			target.CreateFilter(source);
-		} else {
-			*target.filter = target.filter->merge(*source.filter);
-		}
+		QuotientFilterOperationBase::CombineStates(source, target);
 	}
 
 	template <class T, class STATE>
@@ -187,13 +205,15 @@ template <class BIND_DATA_TYPE>
 struct QuotientFilterCreateOperation : QuotientFilterOperationBase {
 	template <class A_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const A_TYPE &a_data, AggregateUnaryInput &idata) {
+		auto &bind_data = idata.input.bind_data->template Cast<BIND_DATA_TYPE>();
 		if (!state.filter) {
-			auto &bind_data = idata.input.bind_data->template Cast<BIND_DATA_TYPE>();
 			state.CreateFilter(bind_data.q, bind_data.r);
 		}
 		auto result = state.filter->insert(a_data);
 		if (!result) {
-			throw IOException("Failed to insert item into quotient filter, likely it is full");
+			throw InvalidInputException(
+			    "quotient_filter: the filter is full (q = %u gives it %llu slots); increase q to hold more values",
+			    bind_data.q, 1ULL << bind_data.q);
 		}
 	}
 
@@ -207,11 +227,7 @@ struct QuotientFilterCreateOperation : QuotientFilterOperationBase {
 
 	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &aggr_input_data) {
-		if (!target.filter) {
-			target.CreateFilter(source);
-		} else {
-			*target.filter = target.filter->merge(*source.filter);
-		}
+		QuotientFilterOperationBase::CombineStates(source, target);
 	}
 
 	template <class T, class STATE>
@@ -236,7 +252,6 @@ auto static QuotientFilterMergeAggregate(const LogicalType &type, const LogicalT
 template <typename T>
 auto static QuotientFilterCreateAggregate(const LogicalType &type, const LogicalType &result_type)
     -> AggregateFunction {
-
 	return AggregateFunction::UnaryAggregateDestructor<QuotientFilterState<T>, T, string_t,
 	                                                   QuotientFilterCreateOperation<QuotientFilterBindData>,
 	                                                   AggregateDestructorType::LEGACY>(type, result_type);
@@ -252,17 +267,37 @@ static inline void QuotientFilterContains(DataChunk &args, ExpressionState &stat
 	auto &item_vector = args.data[1];
 
 	if (filter_vector.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-		auto state = QuotientFilterState<T>(ConstantVector::GetData<string_t>(filter_vector)[0]);
+		if (ConstantVector::IsNull(filter_vector)) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::SetNull(result, true);
+			return;
+		}
+		auto &blob = ConstantVector::GetData<string_t>(filter_vector)[0];
+		// The constructor validates the BLOB and throws if it is not one of ours.
+		QuotientFilter filter(blob.GetData(), blob.GetSize());
 		UnaryExecutor::Execute<T, bool>(item_vector, result, args.size(),
-		                                [&](T item_data) { return state.filter->may_contain(item_data); });
-	} else {
-		BinaryExecutor::Execute<string_t, T, bool>(filter_vector, item_vector, result, args.size(),
-		                                           [&](string_t filter_data, T item_data) {
-			                                           auto state = QuotientFilterState<T>(filter_data);
-
-			                                           return state.filter->may_contain(item_data);
-		                                           });
+		                                [&](T item_data) { return filter.may_contain(item_data); });
+		return;
 	}
+
+	// Per-row filters. Deserializing copies the whole table, and the same filter
+	// is usually repeated across many rows (a join against a table of filters),
+	// so remember the last blob we decoded. Only blobs that passed validation
+	// are cached, and those are always longer than the 12 byte inline threshold,
+	// so their data pointers are stable heap addresses rather than pointers into
+	// a by-value string_t on the stack.
+	unique_ptr<QuotientFilter> cached_filter;
+	const char *cached_data = nullptr;
+	uint32_t cached_size = 0;
+	BinaryExecutor::Execute<string_t, T, bool>(
+	    filter_vector, item_vector, result, args.size(), [&](string_t filter_data, T item_data) {
+		    if (!cached_filter || filter_data.GetData() != cached_data || filter_data.GetSize() != cached_size) {
+			    cached_filter = make_uniq<QuotientFilter>(filter_data.GetData(), filter_data.GetSize());
+			    cached_data = filter_data.GetData();
+			    cached_size = filter_data.GetSize();
+		    }
+		    return cached_filter->may_contain(item_data);
+	    });
 }
 
 // Helper function to register Quotient filter functions for a specific type

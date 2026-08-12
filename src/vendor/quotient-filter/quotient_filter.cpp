@@ -18,42 +18,31 @@ QuotientFilter::QuotientFilter(const QuotientFilter &other) : values(other.value
 }
 
 QuotientFilterValues::QuotientFilterValues(uint32_t q, uint32_t r)
-    : qbits(q), rbits(r), elem_bits(r + 3), entries(0), index_mask(LOW_MASK(q)), rmask(LOW_MASK(r)),
+    : qbits(q), rbits(r), elem_bits(r + 3), reserved(0), entries(0), index_mask(LOW_MASK(q)), rmask(LOW_MASK(r)),
       elem_mask(LOW_MASK(elem_bits)), max_size(1ULL << q) {
 	assert(q > 0);
 	assert(r > 0);
 	assert(q + r <= 64);
 }
 
-QuotientFilter::QuotientFilter(uint32_t q, uint32_t r) : values(q, r), table(QuotientFilter::table_size(q, r)) {
-	std::fill(table.begin(), table.end(), 0);
+QuotientFilter::QuotientFilter(uint32_t q, uint32_t r) : values(q, r), table(QuotientFilter::table_elements(q, r), 0) {
 }
 
-QuotientFilter::QuotientFilter(const std::string &data) {
-	// Deserialize the QuotientFilter from a string
-	memcpy(&values, data.data(), sizeof(QuotientFilterValues));
-	if (data.size() < sizeof(QuotientFilterValues)) {
-		throw duckdb::IOException("Data size is too small to contain QuotientFilterValues");
-	}
-	size_t table_size = QuotientFilter::table_size(values);
-	if (data.size() < sizeof(QuotientFilterValues) + table_size) {
-		throw duckdb::IOException("Data size is too small to contain QuotientFilter table");
-	}
-	table.resize(table_size / sizeof(uint64_t));
-	memcpy(table.data(), data.data() + sizeof(QuotientFilterValues), table.size() * sizeof(uint64_t));
+QuotientFilter::QuotientFilter(const std::string &data) : QuotientFilter(data.data(), data.size()) {
 }
 
 QuotientFilter::QuotientFilter(const char *data, size_t length) {
+	// Validate before copying anything: the header is read straight out of the
+	// buffer and drives every subsequent table index.
+	QuotientFilter::validate_serialized(data, length);
 	memcpy(&values, data, sizeof(QuotientFilterValues));
-	if (length < sizeof(QuotientFilterValues)) {
-		throw duckdb::IOException("Data size is too small to contain QuotientFilterValues");
-	}
-	size_t table_size = QuotientFilter::table_size(values);
-	if (length < sizeof(QuotientFilterValues) + table_size) {
-		throw duckdb::IOException("Data size is too small to contain QuotientFilter table");
-	}
-	table.resize(table_size / sizeof(uint64_t));
-	memcpy(table.data(), data + sizeof(QuotientFilterValues), table.size() * sizeof(uint64_t));
+
+	// Round the element count up. The last uint64_t is partially used whenever
+	// the table's bit count is not a multiple of 64, and get_elem/set_elem still
+	// address it -- rounding down leaves the filter reading past its own table.
+	size_t table_bytes = QuotientFilter::table_size(values);
+	table.assign(QuotientFilter::table_elements(values), 0);
+	memcpy(table.data(), data + sizeof(QuotientFilterValues), table_bytes);
 }
 
 /* Return QF[idx] in the lower bits. */
@@ -157,10 +146,27 @@ inline uint64_t QuotientFilter::hash_to_remainder(uint64_t hash) const {
 }
 
 /* Find the start index of the run for fq (given that the run exists). */
+/*
+ * Every scan below walks slots with incr()/decr(), which mask the index, so a
+ * corrupt table can never read out of bounds -- but it can make a scan wrap
+ * forever. No scan of a well-formed filter visits more slots than the table
+ * has, so tripping this limit means the BLOB's slot metadata is not a filter.
+ */
+static void QuotientFilterScanStep(uint64_t &steps, uint64_t limit) {
+	if (++steps > limit) {
+		throw duckdb::InvalidInputException(
+		    "quotient filter BLOB is corrupt: its slot metadata does not describe a valid filter");
+	}
+}
+
 inline uint64_t QuotientFilter::find_run_index(uint64_t fq) const {
+	const uint64_t limit = this->values.max_size;
+	uint64_t steps = 0;
+
 	/* Find the start of the cluster. */
 	uint64_t b = fq;
 	while (is_shifted(this->get_elem(b))) {
+		QuotientFilterScanStep(steps, limit);
 		b = decr(b);
 	}
 
@@ -168,10 +174,12 @@ inline uint64_t QuotientFilter::find_run_index(uint64_t fq) const {
 	uint64_t s = b;
 	while (b != fq) {
 		do {
+			QuotientFilterScanStep(steps, limit);
 			s = incr(s);
 		} while (is_continuation(this->get_elem(s)));
 
 		do {
+			QuotientFilterScanStep(steps, limit);
 			b = incr(b);
 		} while (!is_occupied(this->get_elem(b)));
 	}
@@ -227,7 +235,9 @@ bool QuotientFilter::insert(uint64_t hash) {
 
 	if (is_occupied(T_fq)) {
 		/* Move the cursor to the insert position in the fq run. */
+		uint64_t steps = 0;
 		do {
+			QuotientFilterScanStep(steps, this->values.max_size);
 			uint64_t rem = get_remainder(this->get_elem(s));
 			if (rem == fr) {
 				return true;
@@ -268,8 +278,10 @@ bool QuotientFilter::may_contain(uint64_t hash) const {
 	}
 
 	/* Scan the sorted run for the target remainder. */
+	uint64_t steps = 0;
 	uint64_t s = this->find_run_index(fq);
 	do {
+		QuotientFilterScanStep(steps, this->values.max_size);
 		uint64_t rem = get_remainder(this->get_elem(s));
 		if (rem == fr) {
 			return true;
@@ -411,15 +423,72 @@ void QuotientFilter::clear() {
 }
 
 size_t QuotientFilter::table_size(const QuotientFilterValues &values) {
-	size_t bits = (1 << values.qbits) * (values.rbits + 3);
-	size_t bytes = bits / 8;
-	return (bits % 8) ? (bytes + 1) : bytes;
+	return QuotientFilter::table_size(values.qbits, values.rbits);
 }
 
 size_t QuotientFilter::table_size(uint32_t q, uint32_t r) {
-	size_t bits = (1 << q) * (r + 3);
-	size_t bytes = bits / 8;
-	return (bits % 8) ? (bytes + 1) : bytes;
+	// 1ULL, not 1: q can be up to 63, and shifting an int that far is undefined
+	// behaviour (it produced garbage table sizes, and crashes, for q >= 31).
+	uint64_t bits = (1ULL << q) * (uint64_t)(r + 3);
+	uint64_t bytes = bits / 8;
+	return (size_t)((bits % 8) ? (bytes + 1) : bytes);
+}
+
+size_t QuotientFilter::table_elements(const QuotientFilterValues &values) {
+	return QuotientFilter::table_elements(values.qbits, values.rbits);
+}
+
+size_t QuotientFilter::table_elements(uint32_t q, uint32_t r) {
+	uint64_t bits = (1ULL << q) * (uint64_t)(r + 3);
+	return (size_t)((bits + 63) / 64);
+}
+
+void QuotientFilter::validate_serialized(const char *data, size_t length) {
+	if (length < sizeof(QuotientFilterValues)) {
+		throw duckdb::InvalidInputException(
+		    "quotient filter BLOB is %llu bytes, which is smaller than the %llu byte header", (uint64_t)length,
+		    (uint64_t)sizeof(QuotientFilterValues));
+	}
+
+	QuotientFilterValues header;
+	memcpy(&header, data, sizeof(QuotientFilterValues));
+
+	// q + r <= 64 with both non-zero, exactly as the constructor requires.
+	if (header.qbits == 0 || header.rbits == 0 || (uint32_t)header.qbits + (uint32_t)header.rbits > 64) {
+		throw duckdb::InvalidInputException(
+		    "quotient filter BLOB has invalid parameters (q = %u, r = %u); q and r must be non-zero and q + r <= 64",
+		    (uint32_t)header.qbits, (uint32_t)header.rbits);
+	}
+	// The derived fields are redundant with q and r, so they must agree. They
+	// are what may_contain() masks its table indices with.
+	if (header.elem_bits != header.rbits + 3 || header.index_mask != LOW_MASK(header.qbits) ||
+	    header.rmask != LOW_MASK(header.rbits) || header.elem_mask != LOW_MASK(header.elem_bits) ||
+	    header.max_size != (1ULL << header.qbits)) {
+		throw duckdb::InvalidInputException("quotient filter BLOB has a header inconsistent with q = %u and r = %u",
+		                                    (uint32_t)header.qbits, (uint32_t)header.rbits);
+	}
+	if ((uint64_t)header.entries > header.max_size) {
+		throw duckdb::InvalidInputException(
+		    "quotient filter BLOB claims %llu entries, which exceeds its capacity of %llu", (uint64_t)header.entries,
+		    header.max_size);
+	}
+
+	// (1ULL << qbits) * (rbits + 3) must not wrap; a filter that large cannot
+	// fit in a BLOB anyway, but the multiplication has to stay well defined.
+	uint64_t slots = 1ULL << header.qbits;
+	uint64_t bits_per_slot = (uint64_t)header.rbits + 3;
+	if (slots > UINT64_MAX / bits_per_slot) {
+		throw duckdb::InvalidInputException("quotient filter BLOB describes a table too large to address (q = %u)",
+		                                    (uint32_t)header.qbits);
+	}
+	uint64_t table_bytes = (slots * bits_per_slot + 7) / 8;
+	if (length - sizeof(QuotientFilterValues) < table_bytes) {
+		throw duckdb::InvalidInputException(
+		    "quotient filter BLOB describes a table of %llu bytes (q = %u, r = %u) but the BLOB only holds %llu bytes "
+		    "after its %llu byte header",
+		    table_bytes, (uint32_t)header.qbits, (uint32_t)header.rbits,
+		    (uint64_t)(length - sizeof(QuotientFilterValues)), (uint64_t)sizeof(QuotientFilterValues));
+	}
 }
 
 QuotientFilterIterator::QuotientFilterIterator(const QuotientFilter &qf) : qf(qf) {
@@ -446,7 +515,9 @@ bool QuotientFilterIterator::done() const {
 }
 
 uint64_t QuotientFilterIterator::next() {
+	uint64_t steps = 0;
 	while (!done()) {
+		QuotientFilterScanStep(steps, qf.values.max_size);
 		uint64_t elt = qf.get_elem(index);
 
 		/* Keep track of the current run. */
@@ -455,7 +526,9 @@ uint64_t QuotientFilterIterator::next() {
 		} else {
 			if (is_run_start(elt)) {
 				uint64_t quot = quotient;
+				uint64_t run_steps = 0;
 				do {
+					QuotientFilterScanStep(run_steps, qf.values.max_size);
 					quot = qf.incr(quot);
 				} while (!is_occupied(qf.get_elem(quot)));
 				quotient = quot;
@@ -473,5 +546,8 @@ uint64_t QuotientFilterIterator::next() {
 		}
 	}
 
-	abort();
+	// Reached when the filter claims more entries than its table holds, which
+	// only a corrupt BLOB can do. Aborting here would take the process down.
+	throw duckdb::InvalidInputException(
+	    "quotient filter BLOB is corrupt: it claims more entries than its table contains");
 }

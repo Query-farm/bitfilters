@@ -1,0 +1,309 @@
+# name: test/sql/xor_filter.test
+# description: xor8/xor16 filter correctness, edge cases, and robustness against malformed filter BLOBs
+# group: [sql]
+
+require bitfilters
+
+# ---------------------------------------------------------------------------
+# No false negatives across a range of cardinalities
+# ---------------------------------------------------------------------------
+
+foreach n 1 2 3 4 5 17 100 1000 40000
+
+statement ok
+create or replace table sample as select hash(i) as k from range(${n}) t(i);
+
+statement ok
+create or replace table filters as
+  select xor8_filter(k) as f8, xor16_filter(k) as f16 from sample;
+
+query II
+select count(*) filter (where xor8_filter_contains(f8, k)) = count(*),
+       count(*) filter (where xor16_filter_contains(f16, k)) = count(*)
+from sample, filters;
+----
+true	true
+
+endloop
+
+# ---------------------------------------------------------------------------
+# Empty and all-NULL inputs produce NULL filters rather than errors
+# ---------------------------------------------------------------------------
+
+statement ok
+create table empty_input (k UBIGINT);
+
+query II
+select xor8_filter(k), xor16_filter(k) from empty_input;
+----
+NULL	NULL
+
+statement ok
+insert into empty_input values (NULL), (NULL), (NULL);
+
+query II
+select xor8_filter(k), xor16_filter(k) from empty_input;
+----
+NULL	NULL
+
+statement ok
+insert into empty_input values (11), (22), (33);
+
+query II
+select xor8_filter_contains(xor8_filter(k), 22), xor16_filter_contains(xor16_filter(k), 22) from empty_input;
+----
+true	true
+
+query II
+select xor8_filter(k), xor16_filter(k) from empty_input where false;
+----
+NULL	NULL
+
+# ---------------------------------------------------------------------------
+# NULL arguments to the probe functions
+# ---------------------------------------------------------------------------
+
+query IIII
+select xor8_filter_contains(NULL::BLOB, 1::UBIGINT),
+       xor16_filter_contains(NULL::BLOB, 1::UBIGINT),
+       xor8_filter_contains(xor8_filter(11::UBIGINT), NULL::UBIGINT),
+       xor16_filter_contains(xor16_filter(11::UBIGINT), NULL::UBIGINT);
+----
+NULL	NULL	NULL	NULL
+
+query I
+select count(*) filter (where xor8_filter_contains(f8, k) is null)
+from sample, (select xor8_filter(k) as f8 from sample where false);
+----
+40000
+
+# ---------------------------------------------------------------------------
+# Duplicate keys and extreme values
+# ---------------------------------------------------------------------------
+
+query II
+select xor8_filter_contains(xor8_filter(7::UBIGINT), 7::UBIGINT),
+       xor16_filter_contains(xor16_filter(7::UBIGINT), 7::UBIGINT)
+from range(10000);
+----
+true	true
+
+statement ok
+create or replace table dups as select (i % 10)::UBIGINT as k from range(100000) t(i);
+
+query II
+select count(distinct k) filter (where xor8_filter_contains(f8, k)),
+       count(distinct k) filter (where xor16_filter_contains(f16, k))
+from dups, (select xor8_filter(k) as f8, xor16_filter(k) as f16 from dups);
+----
+10	10
+
+statement ok
+create or replace table extremes as
+  select * from (values (0::UBIGINT), (1::UBIGINT), (18446744073709551615::UBIGINT),
+                        (9223372036854775808::UBIGINT)) t(k);
+
+query II
+select count(*) filter (where xor8_filter_contains(f8, k)) = count(*),
+       count(*) filter (where xor16_filter_contains(f16, k)) = count(*)
+from extremes, (select xor8_filter(k) as f8, xor16_filter(k) as f16 from extremes);
+----
+true	true
+
+# ---------------------------------------------------------------------------
+# Grouped construction, per-row probing, window and DISTINCT usage
+# ---------------------------------------------------------------------------
+
+statement ok
+create or replace table grouped as select i % 97 as g, hash(i) as k from range(50000) t(i);
+
+statement ok
+create or replace table group_filters as
+  select g, xor8_filter(k) as f8, xor16_filter(k) as f16 from grouped group by g;
+
+query II
+select count(*) filter (where xor8_filter_contains(f8, k)) = count(*),
+       count(*) filter (where xor16_filter_contains(f16, k)) = count(*)
+from grouped join group_filters using (g);
+----
+true	true
+
+# the filter BLOB changes from row to row here
+query II
+select count(*) filter (where xor8_filter_contains(f8, k)) >= 100,
+       count(*) filter (where xor16_filter_contains(f16, k)) >= 100
+from (select k from grouped limit 100) g, group_filters;
+----
+true	true
+
+query II
+select count(*) filter (where xor8_filter_contains(f8, k)) = count(*),
+       count(*) filter (where xor16_filter_contains(f16, k)) = count(*)
+from dups, (select xor8_filter(distinct k) as f8, xor16_filter(distinct k) as f16 from dups);
+----
+true	true
+
+query I
+select xor8_filter_contains(f8, hash(2)) and not xor8_filter_contains(f8, hash(1))
+from (select xor8_filter(hash(i)) filter (where i % 2 = 0) as f8 from range(1000) t(i));
+----
+true
+
+query I
+select count(*) filter (where hit) = count(*) from (
+  select xor8_filter_contains(
+           xor8_filter(hash(i)) over (order by i rows between 5 preceding and current row),
+           hash(i)) as hit
+  from range(2000) t(i));
+----
+true
+
+# ---------------------------------------------------------------------------
+# Filters survive a round trip through storage
+# ---------------------------------------------------------------------------
+
+statement ok
+create or replace table stored_filters as
+  select xor8_filter(hash(i)) as f8, xor16_filter(hash(i)) as f16 from range(5000) t(i);
+
+query II
+select count(*) filter (where xor8_filter_contains(f8, hash(i))) = count(*),
+       count(*) filter (where xor16_filter_contains(f16, hash(i))) = count(*)
+from range(5000) t(i), stored_filters;
+----
+true	true
+
+# ---------------------------------------------------------------------------
+# Serialized size invariants: 16 byte header plus 3 * blockLength fingerprints
+# ---------------------------------------------------------------------------
+
+query III
+select octet_length(f8), octet_length(f16), octet_length(f16) = 2 * octet_length(f8) - 16
+from (select xor8_filter(hash(i)) as f8, xor16_filter(hash(i)) as f16 from range(1000) t(i));
+----
+1276	2536	true
+
+query I
+select (select xor8_filter(hash(i)) from range(1000) t(i)) =
+       (select xor8_filter(hash(i)) from range(1000) t(i));
+----
+true
+
+# ---------------------------------------------------------------------------
+# Malformed filter BLOBs are rejected with an error instead of reading out of
+# bounds. Prior to validation each of these crashed the process.
+# ---------------------------------------------------------------------------
+
+statement error
+select xor8_filter_contains(''::BLOB, 1::UBIGINT);
+----
+smaller than the 16 byte header
+
+statement error
+select xor16_filter_contains('hello'::BLOB, 1::UBIGINT);
+----
+smaller than the 16 byte header
+
+# a header claiming a block length of 2^64-1
+statement error
+select xor8_filter_contains(from_hex('0000000000000000ffffffffffffffff'), 1::UBIGINT);
+----
+block length (18446744073709551615) is not in [1, 4294967295]
+
+# zero block length
+statement error
+select xor8_filter_contains(from_hex('00000000000000000000000000000000'), 1::UBIGINT);
+----
+block length (0) is not in [1, 4294967295]
+
+# block length that does not fit in 32 bits
+statement error
+select xor8_filter_contains(from_hex('00000000000000000000000001000000'), 1::UBIGINT);
+----
+is not in [1, 4294967295]
+
+# header-only BLOB with a plausible block length but no fingerprints
+statement error
+select xor8_filter_contains(from_hex('00000000000000000a00000000000000'), 1::UBIGINT);
+----
+but the BLOB is 16 bytes
+
+# ---------------------------------------------------------------------------
+# Truncated, padded and otherwise mis-sized real filters
+# ---------------------------------------------------------------------------
+
+statement ok
+create or replace table one_filter as
+  select xor8_filter(hash(i)) as f8, xor16_filter(hash(i)) as f16 from range(1000) t(i);
+
+statement error
+select xor8_filter_contains(f8[1:10], 1::UBIGINT) from one_filter;
+----
+smaller than the 16 byte header
+
+statement error
+select xor8_filter_contains(f8[1:100], 1::UBIGINT) from one_filter;
+----
+but the BLOB is 100 bytes
+
+statement error
+select xor16_filter_contains(f16[1:2000], 1::UBIGINT) from one_filter;
+----
+but the BLOB is 2000 bytes
+
+statement error
+select xor8_filter_contains(f8 || from_hex('00'), 1::UBIGINT) from one_filter;
+----
+but the BLOB is 1277 bytes
+
+# ---------------------------------------------------------------------------
+# Filters of the wrong width or from a different filter family are rejected
+# ---------------------------------------------------------------------------
+
+statement error
+select xor16_filter_contains(f8, 1::UBIGINT) from one_filter;
+----
+is not a valid xor16 filter BLOB
+
+statement error
+select xor8_filter_contains(f16, 1::UBIGINT) from one_filter;
+----
+is not a valid xor8 filter BLOB
+
+statement error
+select xor8_filter_contains(binary_fuse8_filter(hash(i)), 1::UBIGINT) from range(1000) t(i);
+----
+is not a valid xor8 filter BLOB
+
+statement error
+select xor16_filter_contains(binary_fuse16_filter(hash(i)), 1::UBIGINT) from range(1000) t(i);
+----
+is not a valid xor16 filter BLOB
+
+statement error
+select xor8_filter_contains(quotient_filter(16, 4, hash(i)), 1::UBIGINT) from range(1000) t(i);
+----
+is not a valid xor8 filter BLOB
+
+# a bad BLOB mixed in with good ones still errors instead of crashing
+statement error
+select count(*) filter (where xor8_filter_contains(f, k)) from
+  (select unnest([(select f8 from one_filter), 'not-a-filter-blob-at-all-really'::BLOB]) as f) filters,
+  (select hash(i) as k from range(10) t(i)) keys;
+----
+is not a valid xor8 filter BLOB
+
+# ---------------------------------------------------------------------------
+# False positive rates stay in the expected range for each width
+# ---------------------------------------------------------------------------
+
+statement ok
+create or replace table fp_probe as
+  select xor8_filter(hash(i)) as f8, xor16_filter(hash(i)) as f16 from range(100000) t(i);
+
+query II
+select count(*) filter (where xor8_filter_contains(f8, hash(i))) between 100 and 1500,
+       count(*) filter (where xor16_filter_contains(f16, hash(i))) <= 20
+from (select i from range(200000, 300000) t(i)) probes, fp_probe;
+----
+true	true

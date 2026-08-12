@@ -66,7 +66,20 @@ Space-efficient filters that support deletion and resizing operations. Learn mor
 #### Functions:
 
 - `quotient_filter(q, r, hash_value)` - Create filter from hash values
+- `quotient_filter(q, r, filter)` - Merge existing quotient filters into one
 - `quotient_filter_contains(filter, hash_value)` - Test membership
+
+#### Behavior:
+
+- `q` and `r` must both be non-zero with `q + r <= 64`, and the resulting filter
+  must fit in a BLOB (4GB), which caps `q` around 32. Filters hold at most `2^q`
+  distinct values; inserting more raises an error.
+- Aggregating an empty set (or only `NULL` values) returns `NULL` rather than a filter.
+- `quotient_filter_contains` returns `NULL` when either argument is `NULL`.
+- The filter BLOB is validated before it is probed or merged. A BLOB that was not
+  produced by `quotient_filter()` — truncated, corrupted, or from a different
+  filter family — raises an `Invalid Input Error` instead of reading out of
+  bounds or scanning forever.
 
 #### Characteristics:
 
@@ -99,6 +112,17 @@ Modern high-performance filters with better space efficiency than Bloom filters.
 - `xor8_filter(hash_value)` - Create 8-bit XOR filter from hash values
 - `xor16_filter_contains(filter, hash_value)` - Test membership in 16-bit filter
 - `xor8_filter_contains(filter, hash_value)` - Test membership in 8-bit filter
+
+#### Behavior:
+
+- Aggregating an empty set (or only `NULL` values) returns `NULL` rather than a filter.
+- `..._contains` returns `NULL` when either argument is `NULL`.
+- The filter BLOB is validated before it is probed. A BLOB that was not produced
+  by the matching `xor8_filter()` / `xor16_filter()` aggregate — truncated,
+  padded, corrupted, from the other fingerprint width, or from a different filter
+  family — raises an `Invalid Input Error` instead of reading out of bounds. The
+  8-bit and 16-bit filters share a header, so a filter must be probed with the
+  function matching the width that built it.
 
 #### Characteristics:
 
@@ -134,6 +158,17 @@ Latest generation filters with optimal space usage and excellent performance. Se
 - `binary_fuse8_filter(hash_value)` - Create 8-bit Binary Fuse filter from hash values
 - `binary_fuse16_filter_contains(filter, hash_value)` - Test membership in 16-bit filter
 - `binary_fuse8_filter_contains(filter, hash_value)` - Test membership in 8-bit filter
+
+#### Behavior:
+
+- Aggregating an empty set (or only `NULL` values) returns `NULL` rather than a filter.
+- `..._contains` returns `NULL` when either argument is `NULL`.
+- The filter BLOB is validated before it is probed. A BLOB that was not produced
+  by the matching `binary_fuse8_filter()` / `binary_fuse16_filter()` aggregate —
+  truncated, padded, corrupted, from the other fingerprint width, or from a
+  different filter family — raises an `Invalid Input Error` instead of reading
+  out of bounds. Note that the 8-bit and 16-bit filters use the same header, so
+  a filter must be probed with the function matching the width that built it.
 
 #### Characteristics:
 

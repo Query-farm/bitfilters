@@ -12,7 +12,6 @@
 #include <string>
 
 struct QuotientFilterValues {
-
 	explicit QuotientFilterValues() : QuotientFilterValues(1, 2) {
 	}
 
@@ -20,6 +19,10 @@ struct QuotientFilterValues {
 	uint8_t qbits;
 	uint8_t rbits;
 	uint8_t elem_bits;
+	// Occupies what would otherwise be a padding byte. The struct is serialized
+	// verbatim, so naming the byte keeps it initialized instead of writing
+	// indeterminate memory into the filter BLOB.
+	uint8_t reserved;
 	uint32_t entries;
 	uint64_t index_mask;
 	uint64_t rmask;
@@ -71,6 +74,24 @@ public:
 	 */
 	static size_t table_size(uint32_t q, uint32_t r);
 	static size_t table_size(const QuotientFilterValues &values);
+
+	/*
+	 * Number of uint64_t slots needed to back a table of `q` quotient bits and
+	 * `r` remainder bits. This rounds up: the last element is partially used
+	 * whenever the bit count is not a multiple of 64, and get_elem/set_elem
+	 * still address it.
+	 */
+	static size_t table_elements(uint32_t q, uint32_t r);
+	static size_t table_elements(const QuotientFilterValues &values);
+
+	/*
+	 * Throws if `data` is not a well-formed serialization produced by
+	 * serialize(). Every deserializing constructor runs this first: the header
+	 * is copied verbatim out of the BLOB, and an inconsistent one would make
+	 * may_contain() index the table out of bounds.
+	 */
+	static void validate_serialized(const char *data, size_t length);
+
 	friend class QuotientFilterIterator;
 
 private:
@@ -90,10 +111,14 @@ private:
 public:
 	[[nodiscard]] std::string serialize() const {
 		// Serialize the QuotientFilter to a string
-		size_t needed_bytes = sizeof(QuotientFilterValues) + table_size(values);
+		size_t table_bytes = table_size(values);
+		size_t needed_bytes = sizeof(QuotientFilterValues) + table_bytes;
 		std::string out(needed_bytes, '\0');
 		memcpy((char *)out.data(), &values, sizeof(QuotientFilterValues));
-		memcpy((char *)out.data() + sizeof(QuotientFilterValues), table.data(), table.size());
+		// Copy the table by byte count, not by element count: the two are only
+		// the same for tables built by the (q, r) constructor, and copying
+		// table.size() bytes truncates a filter that was itself deserialized.
+		memcpy((char *)out.data() + sizeof(QuotientFilterValues), table.data(), table_bytes);
 		return out;
 	}
 
@@ -105,7 +130,6 @@ public:
 };
 
 class QuotientFilterIterator {
-
 public:
 	QuotientFilterIterator(const QuotientFilter &qf);
 	bool done() const;
