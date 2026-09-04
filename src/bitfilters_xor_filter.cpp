@@ -1,6 +1,7 @@
 #include "bitfilters_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
@@ -11,65 +12,74 @@ namespace duckdb {
 
 namespace {
 
-struct XorFilterBindData : public FunctionData {
-	explicit XorFilterBindData() {
-	}
+// Serialized layout written by xor{8,16}_serialize (native endianness):
+//
+//   uint64 seed | uint64 blockLength | fingerprint[3 * blockLength]
+constexpr idx_t XOR_HEADER_BYTES = 2 * sizeof(uint64_t);
 
-	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<XorFilterBindData>();
-	}
+// xor{8,16}_contain truncates blockLength to 32 bits when computing indices, so
+// a filter whose block length does not fit in 32 bits could never be probed
+// correctly (and cannot be produced by xor{8,16}_allocate).
+constexpr uint64_t XOR_MAX_BLOCK_LENGTH = NumericLimits<uint32_t>::Maximum();
 
-	bool Equals(const FunctionData &other_p) const override {
-		//		auto &other = other_p.Cast<XorFilterBindData>();
-		return true;
-	}
-};
+// The xor construction spreads each key over three blocks.
+constexpr uint64_t XOR_BLOCKS = 3;
 
-unique_ptr<FunctionData> XorFilterBind(ClientContext &context, AggregateFunction &function,
-                                       vector<unique_ptr<Expression>> &arguments) {
-	return make_uniq<XorFilterBindData>();
+// A deserialized filter points its fingerprint array straight into a BLOB,
+// which carries no alignment guarantee, so 16-bit fingerprints have to be read
+// byte-wise. Dereferencing them as uint16_t is undefined behaviour (UBSan flags
+// it) and faults outright on strict-alignment platforms.
+inline uint16_t LoadUnaligned16(const uint16_t *base, uint32_t index) {
+	uint16_t value;
+	memcpy(&value, reinterpret_cast<const char *>(base) + index * sizeof(uint16_t), sizeof(uint16_t));
+	return value;
 }
 
-template <class T>
-struct XorFilterState {
-	std::unique_ptr<std::vector<uint64_t>> entries = nullptr;
-
-	XorFilterState() = delete;
-
-	explicit XorFilterState(const string_t &data) {
-		entries = make_uniq<std::vector<uint64_t>>();
-	}
-};
-
-struct XorFilterOperationBase {
-	template <class STATE>
-	static void Initialize(STATE &state) {
-		state.filter.release();
-		state.filter = nullptr;
-	}
-
-	static bool IgnoreNull() {
-		return true;
-	}
-
-	template <class STATE>
-	static void Destroy(STATE &state, AggregateInputData &aggr_input_data) {
-		if (state.filter) {
-			state.filter = nullptr;
-		}
-	}
-};
-
 template <typename FilterType>
-struct XorCreateTraits;
+struct XorTraits;
 
 template <>
-struct XorCreateTraits<xor16_t> {
-	static bool Allocate(size_t n, xor16_t *filter) {
-		return xor16_allocate(n, filter);
+struct XorTraits<xor8_t> {
+	using FingerprintType = uint8_t;
+
+	static const char *Name() {
+		return "xor8";
 	}
-	static bool Populate(uint64_t *data, size_t n, xor16_t *filter) {
-		return xor16_buffered_populate(data, n, filter);
+	static bool Allocate(uint32_t size, xor8_t *filter) {
+		return xor8_allocate(size, filter);
+	}
+	static bool Populate(uint64_t *keys, uint32_t size, xor8_t *filter) {
+		return xor8_buffered_populate(keys, size, filter);
+	}
+	static size_t SerializationBytes(xor8_t *filter) {
+		return xor8_serialization_bytes(filter);
+	}
+	static void Serialize(const xor8_t *filter, char *buffer) {
+		xor8_serialize(filter, buffer);
+	}
+	static void Free(xor8_t *filter) {
+		xor8_free(filter);
+	}
+	static bool Contains(uint64_t item, const xor8_t *filter) {
+		return xor8_contain(item, filter);
+	}
+	static void SetFingerprints(xor8_t *filter, const char *data) {
+		filter->fingerprints = reinterpret_cast<uint8_t *>(const_cast<char *>(data));
+	}
+};
+
+template <>
+struct XorTraits<xor16_t> {
+	using FingerprintType = uint16_t;
+
+	static const char *Name() {
+		return "xor16";
+	}
+	static bool Allocate(uint32_t size, xor16_t *filter) {
+		return xor16_allocate(size, filter);
+	}
+	static bool Populate(uint64_t *keys, uint32_t size, xor16_t *filter) {
+		return xor16_buffered_populate(keys, size, filter);
 	}
 	static size_t SerializationBytes(xor16_t *filter) {
 		return xor16_serialization_bytes(filter);
@@ -80,35 +90,111 @@ struct XorCreateTraits<xor16_t> {
 	static void Free(xor16_t *filter) {
 		xor16_free(filter);
 	}
-};
-
-template <>
-struct XorCreateTraits<xor8_t> {
-	static bool Allocate(size_t n, xor8_t *filter) {
-		return xor8_allocate(n, filter);
+	// xor16_contain, with unaligned-safe fingerprint loads.
+	static bool Contains(uint64_t item, const xor16_t *filter) {
+		uint64_t hash = xor_mix_split(item, filter->seed);
+		uint16_t f = (uint16_t)xor_fingerprint(hash);
+		uint32_t r0 = (uint32_t)hash;
+		uint32_t r1 = (uint32_t)xor_rotl64(hash, 21);
+		uint32_t r2 = (uint32_t)xor_rotl64(hash, 42);
+		uint32_t block_length = (uint32_t)filter->blockLength;
+		uint32_t h0 = xor_reduce(r0, block_length);
+		uint32_t h1 = xor_reduce(r1, block_length) + block_length;
+		uint32_t h2 = xor_reduce(r2, block_length) + 2 * block_length;
+		return f == (uint16_t)(LoadUnaligned16(filter->fingerprints, h0) ^ LoadUnaligned16(filter->fingerprints, h1) ^
+		                       LoadUnaligned16(filter->fingerprints, h2));
 	}
-	static bool Populate(uint64_t *data, size_t n, xor8_t *filter) {
-		return xor8_buffered_populate(data, n, filter);
-	}
-	static size_t SerializationBytes(const xor8_t *filter) {
-		return xor8_serialization_bytes(filter);
-	}
-	static void Serialize(const xor8_t *filter, char *buffer) {
-		xor8_serialize(filter, buffer);
-	}
-	static void Free(xor8_t *filter) {
-		xor8_free(filter);
+	static void SetFingerprints(xor16_t *filter, const char *data) {
+		filter->fingerprints = reinterpret_cast<uint16_t *>(const_cast<char *>(data));
 	}
 };
 
-template <class BIND_DATA_TYPE, typename FilterType>
+template <typename FilterType>
+uint64_t XorExactSerializedSize(uint64_t block_length) {
+	return XOR_HEADER_BYTES + XOR_BLOCKS * block_length * sizeof(typename XorTraits<FilterType>::FingerprintType);
+}
+
+template <typename FilterType>
+InvalidInputException XorInvalidBlob(const string &detail) {
+	return InvalidInputException("%s_filter_contains: the filter argument is not a valid %s filter BLOB (%s). Filter "
+	                             "BLOBs must be produced by %s_filter().",
+	                             XorTraits<FilterType>::Name(), XorTraits<FilterType>::Name(), detail,
+	                             XorTraits<FilterType>::Name());
+}
+
+// Reads a serialized filter out of `blob` without copying: on success `filter`
+// points its fingerprints array directly at the BLOB's bytes, so `filter` must
+// not outlive `blob` and must never be passed to xor*_free.
+//
+// xor*_contain indexes the fingerprint array at h0 < blockLength,
+// h1 < 2 * blockLength and h2 < 3 * blockLength, so requiring the BLOB to hold
+// exactly 3 * blockLength fingerprints bounds every read. Without the check any
+// BLOB (a truncated filter, a filter of the other width, a binary fuse filter,
+// arbitrary user bytes) turns into wild reads far outside the BLOB.
+template <typename FilterType>
+void DeserializeFilter(FilterType &filter, const string_t &blob) {
+	using Traits = XorTraits<FilterType>;
+
+	const auto size = static_cast<uint64_t>(blob.GetSize());
+	const auto *data = blob.GetData();
+
+	if (size < XOR_HEADER_BYTES) {
+		throw XorInvalidBlob<FilterType>(
+		    StringUtil::Format("it is %llu bytes, which is smaller than the %llu byte header", size,
+		                       static_cast<uint64_t>(XOR_HEADER_BYTES)));
+	}
+
+	uint64_t seed, block_length;
+	memcpy(&seed, data, sizeof(seed));
+	memcpy(&block_length, data + sizeof(seed), sizeof(block_length));
+
+	if (block_length == 0 || block_length > XOR_MAX_BLOCK_LENGTH) {
+		throw XorInvalidBlob<FilterType>(
+		    StringUtil::Format("its block length (%llu) is not in [1, %llu]", block_length, XOR_MAX_BLOCK_LENGTH));
+	}
+
+	// Require an exact length match. Besides catching truncation, this is what
+	// distinguishes an 8-bit filter from a 16-bit one: the headers are
+	// identical, only the fingerprint width differs.
+	const uint64_t exact_size = XorExactSerializedSize<FilterType>(block_length);
+	if (size != exact_size) {
+		throw XorInvalidBlob<FilterType>(StringUtil::Format(
+		    "its header describes a filter of %llu bytes (%llu byte header plus %llu %u-bit fingerprints) but the BLOB "
+		    "is %llu bytes",
+		    exact_size, static_cast<uint64_t>(XOR_HEADER_BYTES), XOR_BLOCKS * block_length,
+		    static_cast<uint32_t>(sizeof(typename Traits::FingerprintType) * 8), size));
+	}
+
+	filter.seed = seed;
+	filter.blockLength = block_length;
+	Traits::SetFingerprints(&filter, data + XOR_HEADER_BYTES);
+}
+
+struct XorFilterState {
+	// Raw pointer rather than unique_ptr: aggregate states are handed to us as
+	// uninitialized memory, so a smart pointer's assignment operator would run
+	// over (and try to free) a garbage pointer.
+	std::vector<uint64_t> *entries;
+};
+
+// Frees the vendored filter's fingerprint array when Finalize leaves early via
+// an exception.
+template <typename FilterType>
+struct XorFilterGuard {
+	explicit XorFilterGuard(FilterType &filter_p) : filter(filter_p) {
+	}
+	~XorFilterGuard() {
+		XorTraits<FilterType>::Free(&filter);
+	}
+	FilterType &filter;
+};
+
+template <typename FilterType>
 struct XorFilterCreateOperation {
-
-	using Traits = XorCreateTraits<FilterType>;
+	using Traits = XorTraits<FilterType>;
 
 	template <class STATE>
 	static void Initialize(STATE &state) {
-		state.entries.release();
 		state.entries = nullptr;
 	}
 
@@ -118,25 +204,27 @@ struct XorFilterCreateOperation {
 
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
-		if (state.entries) {
-			state.entries = nullptr;
+		delete state.entries;
+		state.entries = nullptr;
+	}
+
+	template <class STATE>
+	static std::vector<uint64_t> &Entries(STATE &state) {
+		if (!state.entries) {
+			state.entries = new std::vector<uint64_t>();
 		}
+		return *state.entries;
 	}
 
 	template <class A_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const A_TYPE &a_data, AggregateUnaryInput &) {
-		if (!state.entries) {
-			state.entries = make_uniq<std::vector<uint64_t>>();
-		}
-		state.entries->push_back(a_data);
+		Entries(state).push_back(a_data);
 	}
 
 	template <class INPUT_TYPE, class STATE, class OP>
-	static void ConstantOperation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input,
-	                              idx_t count) {
-		for (idx_t i = 0; i < count; i++) {
-			Operation<INPUT_TYPE, STATE, OP>(state, input, unary_input);
-		}
+	static void ConstantOperation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &, idx_t count) {
+		auto &entries = Entries(state);
+		entries.insert(entries.end(), count, input);
 	}
 
 	template <class STATE, class OP>
@@ -144,76 +232,64 @@ struct XorFilterCreateOperation {
 		if (!source.entries || source.entries->empty()) {
 			return;
 		}
-		if (!target.entries) {
-			target.entries = make_uniq<std::vector<uint64_t>>();
-		}
-		target.entries->reserve(target.entries->size() + source.entries->size());
-		target.entries->insert(target.entries->end(), std::make_move_iterator(source.entries->begin()),
-		                       std::make_move_iterator(source.entries->end()));
+		auto &target_entries = Entries(target);
+		target_entries.reserve(target_entries.size() + source.entries->size());
+		target_entries.insert(target_entries.end(), source.entries->begin(), source.entries->end());
 	}
 
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.entries || state.entries->empty()) {
 			finalize_data.ReturnNull();
-		} else {
-			FilterType filter;
-			if (!Traits::Allocate(state.entries->size(), &filter)) {
-				throw IOException("Failed to allocate filter");
-			}
-			if (!Traits::Populate(state.entries->data(), state.entries->size(), &filter)) {
-				Traits::Free(&filter);
-				throw IOException("Failed to populate filter");
-			}
-			size_t serial_size = Traits::SerializationBytes(&filter);
-			std::vector<char> buffer(serial_size);
-			Traits::Serialize(&filter, buffer.data());
-			target = StringVector::AddStringOrBlob(finalize_data.result, buffer.data(), serial_size);
-			Traits::Free(&filter);
+			return;
 		}
+		auto &entries = *state.entries;
+		if (entries.size() > NumericLimits<uint32_t>::Maximum()) {
+			throw OutOfRangeException("%s_filter: cannot build a filter over %llu values, the maximum is %u",
+			                          Traits::Name(), static_cast<uint64_t>(entries.size()),
+			                          NumericLimits<uint32_t>::Maximum());
+		}
+		const auto count = static_cast<uint32_t>(entries.size());
+
+		FilterType filter;
+		if (!Traits::Allocate(count, &filter)) {
+			throw OutOfMemoryException("%s_filter: failed to allocate a filter for %u values", Traits::Name(), count);
+		}
+		XorFilterGuard<FilterType> guard(filter);
+
+		// Populate may reorder `entries` in place, which is fine -- the state is
+		// dead once we have finalized it.
+		if (!Traits::Populate(entries.data(), count, &filter)) {
+			throw InvalidInputException(
+			    "%s_filter: failed to construct a filter over %u values. This is usually caused by running out of "
+			    "memory, or by an input distribution the construction algorithm could not resolve.",
+			    Traits::Name(), count);
+		}
+
+		const auto exact_size = XorExactSerializedSize<FilterType>(filter.blockLength);
+		if (exact_size > NumericLimits<uint32_t>::Maximum()) {
+			throw OutOfRangeException("%s_filter: the resulting filter would be %llu bytes, which exceeds the maximum "
+			                          "BLOB size of %u bytes",
+			                          Traits::Name(), exact_size, NumericLimits<uint32_t>::Maximum());
+		}
+		const auto buffer_size = Traits::SerializationBytes(&filter);
+		D_ASSERT(buffer_size >= exact_size);
+		std::vector<char> buffer(buffer_size);
+		Traits::Serialize(&filter, buffer.data());
+		target = StringVector::AddStringOrBlob(finalize_data.result, buffer.data(), exact_size);
 	}
 };
 
 template <typename T, typename FilterType>
 auto static XorFilterCreateAggregate(const LogicalType &type, const LogicalType &result_type) -> AggregateFunction {
-
-	return AggregateFunction::UnaryAggregateDestructor<XorFilterState<T>, T, string_t,
-	                                                   XorFilterCreateOperation<XorFilterBindData, FilterType>,
-	                                                   AggregateDestructorType::LEGACY>(type, result_type);
+	return AggregateFunction::UnaryAggregateDestructor<
+	    XorFilterState, T, string_t, XorFilterCreateOperation<FilterType>, AggregateDestructorType::LEGACY>(
+	    type, result_type);
 }
-
-template <typename FilterType>
-struct XorFilterContainsTraits;
-
-template <>
-struct XorFilterContainsTraits<xor16_t> {
-	static void Deserialize(xor16_t *filter, const char *data) {
-		xor16_deserialize_no_copy(filter, data);
-	}
-	static bool Contains(uint64_t item, const xor16_t *filter) {
-		return xor16_contain(item, filter);
-	}
-	static void Free(xor16_t *filter) {
-		//		xor16_free(filter);
-	}
-};
-
-template <>
-struct XorFilterContainsTraits<xor8_t> {
-	static void Deserialize(xor8_t *filter, const char *data) {
-		xor8_deserialize_no_copy(filter, data);
-	}
-	static bool Contains(uint64_t item, const xor8_t *filter) {
-		return xor8_contain(item, filter);
-	}
-	static void Free(xor8_t *filter) {
-		//		xor8_free(filter);
-	}
-};
 
 template <class T, typename FilterType>
 static inline void XorFilterContains(DataChunk &args, ExpressionState &state, Vector &result) {
-	using Traits = XorFilterContainsTraits<FilterType>;
+	using Traits = XorTraits<FilterType>;
 
 	D_ASSERT(args.ColumnCount() == 2);
 
@@ -221,36 +297,43 @@ static inline void XorFilterContains(DataChunk &args, ExpressionState &state, Ve
 	auto &item_vector = args.data[1];
 
 	if (filter_vector.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+		if (ConstantVector::IsNull(filter_vector)) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::SetNull(result, true);
+			return;
+		}
 		FilterType deserialized_filter;
-		auto &data = ConstantVector::GetData<string_t>(filter_vector)[0];
-
-		Traits::Deserialize(&deserialized_filter, data.GetData());
+		DeserializeFilter(deserialized_filter, ConstantVector::GetData<string_t>(filter_vector)[0]);
 
 		UnaryExecutor::Execute<T, bool>(item_vector, result, args.size(),
 		                                [&](T item_data) { return Traits::Contains(item_data, &deserialized_filter); });
-
-		Traits::Free(&deserialized_filter);
-	} else {
-		BinaryExecutor::Execute<string_t, T, bool>(filter_vector, item_vector, result, args.size(),
-		                                           [&](string_t filter_data, T item_data) {
-			                                           FilterType deserialized_filter;
-
-			                                           Traits::Deserialize(&deserialized_filter, filter_data.GetData());
-
-			                                           bool result = Traits::Contains(item_data, &deserialized_filter);
-			                                           Traits::Free(&deserialized_filter);
-			                                           return result;
-		                                           });
+		return;
 	}
+
+	// Per-row filters. The same filter is usually repeated across many rows (a
+	// join against a table of filters), so remember the last blob we validated.
+	// Only blobs that passed validation are cached, and those are always longer
+	// than the 12 byte inline threshold, so their data pointers are stable heap
+	// addresses rather than pointers into a by-value string_t on the stack.
+	FilterType deserialized_filter;
+	const char *cached_data = nullptr;
+	uint32_t cached_size = 0;
+	BinaryExecutor::Execute<string_t, T, bool>(
+	    filter_vector, item_vector, result, args.size(), [&](string_t filter_data, T item_data) {
+		    if (filter_data.GetData() != cached_data || filter_data.GetSize() != cached_size) {
+			    DeserializeFilter(deserialized_filter, filter_data);
+			    cached_data = filter_data.GetData();
+			    cached_size = filter_data.GetSize();
+		    }
+		    return Traits::Contains(item_data, &deserialized_filter);
+	    });
 }
 
 // Helper function to register Xor filter functions for a specific type
 template <typename T, typename FilterType>
 static void RegisterXorFilterFunctionsForType(AggregateFunctionSet &Xorfilter, const LogicalType &type) {
 	// Register create aggregate function
-	auto fun = XorFilterCreateAggregate<T, FilterType>(type, LogicalType::BLOB);
-	fun.bind = XorFilterBind;
-	Xorfilter.AddFunction(fun);
+	Xorfilter.AddFunction(XorFilterCreateAggregate<T, FilterType>(type, LogicalType::BLOB));
 }
 
 // Helper function to register scalar contains functions for a specific type
@@ -268,8 +351,12 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo Xorfilter_create_info(Xorfilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Xor16 filter with ~0.0015% false positive rate.";
+			desc.description = "Creates an Xor16 filter (16-bit fingerprints, ~0.0015% false positive rate) "
+			                   "by aggregating UBIGINT values. Returns a BLOB to probe with xor16_filter_contains.";
+			desc.parameter_names = {"value"};
+			desc.parameter_types = {LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT xor16_filter(hash(column)) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(Xorfilter_create_info);
@@ -281,8 +368,12 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateAggregateFunctionInfo Xorfilter_create_info(Xorfilter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Xor8 filter with ~0.4% false positive rate.";
+			desc.description = "Creates an Xor8 filter (8-bit fingerprints, ~0.4% false positive rate) "
+			                   "by aggregating UBIGINT values. Returns a BLOB to probe with xor8_filter_contains.";
+			desc.parameter_names = {"value"};
+			desc.parameter_types = {LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT xor8_filter(hash(column)) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(Xorfilter_create_info);
@@ -295,10 +386,13 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateScalarFunctionInfo info(std::move(fs));
 		{
 			FunctionDescription desc;
-			desc.description = "Tests if a Xor16 filter may contain a value. Returns true if the value "
+			desc.description = "Tests if an Xor16 filter may contain a value. Returns true if the value "
 			                   "might be in the set (with possible false positives), or false if the value "
 			                   "is definitely not in the set (no false negatives).";
+			desc.parameter_names = {"filter", "value"};
+			desc.parameter_types = {LogicalType::BLOB, LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT xor16_filter_contains(filter, 42) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(info);
@@ -310,10 +404,13 @@ void LoadXorFilter(ExtensionLoader &loader) {
 		CreateScalarFunctionInfo info(std::move(fs));
 		{
 			FunctionDescription desc;
-			desc.description = "Tests if a Xor8 filter may contain a value. Returns true if the value "
+			desc.description = "Tests if an Xor8 filter may contain a value. Returns true if the value "
 			                   "might be in the set (with possible false positives), or false if the value "
 			                   "is definitely not in the set (no false negatives).";
+			desc.parameter_names = {"filter", "value"};
+			desc.parameter_types = {LogicalType::BLOB, LogicalType::UBIGINT};
 			desc.examples.push_back("SELECT xor8_filter_contains(filter, 42) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
 		loader.RegisterFunction(info);

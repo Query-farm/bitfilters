@@ -64,8 +64,8 @@ static DuckDbHashVersion ParseVersion(const string &version_str) {
 		return DuckDbHashVersion::V1_6_0;
 	}
 	throw BinderException("Unsupported DuckDB version '%s' for bitfilters DuckDB hash/bloom filter. "
-	                       "Supported versions: v1.4.0-v1.4.4, v1.5.0, v1.5.1, v1.6.0",
-	                       version_str);
+	                      "Supported versions: v1.4.0-v1.4.4, v1.5.0, v1.5.1, v1.6.0",
+	                      version_str);
 }
 
 // ============================================================================
@@ -280,7 +280,7 @@ struct DuckDbHashBindData : public FunctionData {
 };
 
 static unique_ptr<FunctionData> DuckDbHashBind(ClientContext &context, ScalarFunction &function,
-                                                vector<unique_ptr<Expression>> &arguments) {
+                                               vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.empty()) {
 		throw BinderException("bitfilters_duckdb_hash requires at least 2 arguments: version and value(s)");
 	}
@@ -292,9 +292,8 @@ static unique_ptr<FunctionData> DuckDbHashBind(ClientContext &context, ScalarFun
 		throw BinderException("bitfilters_duckdb_hash: version cannot be NULL");
 	}
 	auto version = ParseVersion(version_val.ToString());
-	Function::EraseArgument(function, arguments, 0);
 
-	if (arguments.empty()) {
+	if (arguments.size() < 2) {
 		throw BinderException("bitfilters_duckdb_hash requires at least one value argument after version");
 	}
 
@@ -309,11 +308,17 @@ static void DuckDbHashFunction(DataChunk &args, ExpressionState &state, Vector &
 	auto count = args.size();
 	auto result_data = FlatVector::GetData<uint64_t>(result);
 
-	// Hash first column directly into result
-	HashVector_v1_5(args.data[0], result_data, count);
+	// args.data[0] is the version string, which stays in the argument list: the
+	// binder re-verifies bound functions against their registered signature in
+	// debug builds, so erasing an argument at bind time makes the function
+	// unbindable there.
+	D_ASSERT(args.ColumnCount() >= 2);
+
+	// Hash first value column directly into result
+	HashVector_v1_5(args.data[1], result_data, count);
 
 	// Combine with remaining columns
-	for (idx_t col_idx = 1; col_idx < args.ColumnCount(); col_idx++) {
+	for (idx_t col_idx = 2; col_idx < args.ColumnCount(); col_idx++) {
 		CombineHashVector_v1_5(args.data[col_idx], result_data, count);
 	}
 
@@ -353,13 +358,13 @@ struct DuckDbBloomFilterProbeBindData : public FunctionData {
 		// Allow up to 1<<40 (~8TB filter) to be generous, but prevent overflow.
 		if (num_sectors > (1ULL << 40)) {
 			throw InvalidInputException(
-			    "bitfilters_duckdb_bloom_filter_probe: num_sectors too large (%llu), max is %llu",
-			    num_sectors, (1ULL << 40));
+			    "bitfilters_duckdb_bloom_filter_probe: num_sectors too large (%llu), max is %llu", num_sectors,
+			    (1ULL << 40));
 		}
 		auto expected_size = (num_sectors + 1) * sizeof(uint64_t);
 		if (blob_copy.size() < expected_size) {
-			throw InvalidInputException(
-			    "bitfilters_duckdb_bloom_filter_probe: filter blob too short for %llu sectors", num_sectors);
+			throw InvalidInputException("bitfilters_duckdb_bloom_filter_probe: filter blob too short for %llu sectors",
+			                            num_sectors);
 		}
 		bitmask = num_sectors - 1;
 		sectors = reinterpret_cast<const uint64_t *>(blob_copy.data() + sizeof(uint64_t));
@@ -377,10 +382,10 @@ struct DuckDbBloomFilterProbeBindData : public FunctionData {
 };
 
 static unique_ptr<FunctionData> DuckDbBloomFilterProbeBind(ClientContext &context, ScalarFunction &function,
-                                                            vector<unique_ptr<Expression>> &arguments) {
+                                                           vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.size() < 3) {
 		throw BinderException("bitfilters_duckdb_bloom_filter_probe requires at least 3 arguments: "
-		                       "version, filter_blob, value(s)");
+		                      "version, filter_blob, value(s)");
 	}
 	// Validate and extract version (constant)
 	if (!arguments[0]->IsFoldable()) {
@@ -404,14 +409,11 @@ static unique_ptr<FunctionData> DuckDbBloomFilterProbeBind(ClientContext &contex
 		filter_is_constant = true;
 	}
 
-	// Erase version argument (always constant)
-	Function::EraseArgument(function, arguments, 0); // version
-	// Erase filter argument only if it was constant-folded
-	if (filter_is_constant) {
-		Function::EraseArgument(function, arguments, 0); // filter
-	}
-
-	if (arguments.empty()) {
+	// The version and filter arguments stay in the argument list. The binder
+	// re-verifies bound functions against their registered signature in debug
+	// builds, so erasing an argument at bind time makes the function unbindable
+	// there; the execution function skips them by index instead.
+	if (arguments.size() < 3) {
 		throw BinderException("bitfilters_duckdb_bloom_filter_probe requires at least one value argument");
 	}
 
@@ -425,24 +427,26 @@ static void DuckDbBloomFilterProbeFunction(DataChunk &args, ExpressionState &sta
 	auto count = args.size();
 	auto result_data = FlatVector::GetData<bool>(result);
 
-	// Determine which column index the value arguments start at
-	idx_t value_start = bind_data.filter_is_constant ? 0 : 1;
+	// args.data[0] is the version and args.data[1] the filter blob; values follow
+	D_ASSERT(args.ColumnCount() >= 3);
+	const idx_t value_start = 2;
 
-	// For non-constant filter, parse from first column
+	// For non-constant filter, parse from the filter column
 	const uint64_t *sectors;
 	uint64_t bitmask;
 	// Holds parsed blob data for the non-constant case (must outlive the probe loop)
 	unique_ptr<DuckDbBloomFilterProbeBindData> runtime_bd;
 	if (!bind_data.filter_is_constant) {
-		// Get filter from first column (must be constant vector or we parse per-row)
-		auto &filter_vec = args.data[0];
+		// The filter must be constant across the chunk or we cannot parse it once
+		auto &filter_vec = args.data[1];
 		if (filter_vec.GetVectorType() == VectorType::CONSTANT_VECTOR) {
 			auto filter_str = ConstantVector::GetData<string_t>(filter_vec)[0];
 			runtime_bd = make_uniq<DuckDbBloomFilterProbeBindData>(bind_data.version, filter_str.GetString(), true);
 			sectors = runtime_bd->sectors;
 			bitmask = runtime_bd->bitmask;
 		} else {
-			throw InvalidInputException("bitfilters_duckdb_bloom_filter_probe: filter blob must be constant across rows");
+			throw InvalidInputException(
+			    "bitfilters_duckdb_bloom_filter_probe: filter blob must be constant across rows");
 		}
 	} else {
 		sectors = bind_data.sectors;
@@ -582,10 +586,10 @@ struct DuckDbBloomFilterCreateOperation {
 };
 
 static unique_ptr<FunctionData> DuckDbBloomFilterCreateBind(ClientContext &context, AggregateFunction &function,
-                                                             vector<unique_ptr<Expression>> &arguments) {
+                                                            vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.size() < 3) {
 		throw BinderException("bitfilters_duckdb_bloom_filter_create requires at least 3 arguments: "
-		                       "version, num_sectors, value(s)");
+		                      "version, num_sectors, value(s)");
 	}
 
 	// Version (constant string)
@@ -609,7 +613,7 @@ static unique_ptr<FunctionData> DuckDbBloomFilterCreateBind(ClientContext &conte
 	auto num_sectors = sectors_val.GetValue<uint64_t>();
 	if (num_sectors == 0 || (num_sectors & (num_sectors - 1)) != 0) {
 		throw BinderException("bitfilters_duckdb_bloom_filter_create: num_sectors must be a power of 2, got %llu",
-		                       num_sectors);
+		                      num_sectors);
 	}
 
 	Function::EraseArgument(function, arguments, 0); // version
@@ -620,9 +624,9 @@ static unique_ptr<FunctionData> DuckDbBloomFilterCreateBind(ClientContext &conte
 
 template <typename T>
 static AggregateFunction CreateBloomFilterAggregate(const LogicalType &type) {
-	return AggregateFunction::UnaryAggregateDestructor<DuckDbBloomFilterCreateState, T, string_t,
-	                                                   DuckDbBloomFilterCreateOperation,
-	                                                   AggregateDestructorType::LEGACY>(type, LogicalType::BLOB);
+	return AggregateFunction::UnaryAggregateDestructor<
+	    DuckDbBloomFilterCreateState, T, string_t, DuckDbBloomFilterCreateOperation, AggregateDestructorType::LEGACY>(
+	    type, LogicalType::BLOB);
 }
 
 } // namespace
@@ -644,9 +648,13 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		FunctionDescription desc;
 		desc.description = "Computes the DuckDB-internal hash value for the given DuckDB version. "
 		                   "The hash matches DuckDB's built-in hash() function for that version. "
-		                   "Multiple values are combined using the version's CombineHash algorithm.";
+		                   "Multiple values are combined using the version's CombineHash algorithm. "
+		                   "Supported versions: v1.4.0-v1.4.4, v1.5.0, v1.5.1, v1.6.0.";
+		desc.parameter_names = {"version", "value"};
+		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::ANY};
 		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v1.5.1', 42)");
 		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v1.5.1', col1, col2) FROM tbl");
+		desc.categories = {"bitfilters", "hash"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(info);
 	}
@@ -655,7 +663,7 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet fs("bitfilters_duckdb_bloom_filter_probe");
 		auto func = ScalarFunction({LogicalType::VARCHAR, LogicalType::BLOB}, LogicalType::BOOLEAN,
-		                            DuckDbBloomFilterProbeFunction, DuckDbBloomFilterProbeBind);
+		                           DuckDbBloomFilterProbeFunction, DuckDbBloomFilterProbeBind);
 		func.varargs = LogicalType::ANY;
 		fs.AddFunction(func);
 
@@ -665,10 +673,12 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		                   "The version parameter specifies which DuckDB hash algorithm to use. "
 		                   "The filter blob and version are constant-folded at bind time. "
 		                   "Multiple value arguments are combined for multi-key bloom filter probes.";
-		desc.examples.push_back(
-		    "SELECT bitfilters_duckdb_bloom_filter_probe('v1.5.1', filter_blob, key_col) FROM tbl");
+		desc.parameter_names = {"version", "filter_blob", "value"};
+		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY};
+		desc.examples.push_back("SELECT bitfilters_duckdb_bloom_filter_probe('v1.5.1', filter_blob, key_col) FROM tbl");
 		desc.examples.push_back(
 		    "SELECT bitfilters_duckdb_bloom_filter_probe('v1.5.1', filter_blob, col1, col2) FROM tbl");
+		desc.categories = {"bitfilters", "probabilistic"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(info);
 	}
@@ -680,8 +690,8 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 
 		auto func = CreateBloomFilterAggregate<uint64_t>(LogicalType::UBIGINT);
 		func.bind = DuckDbBloomFilterCreateBind;
-		func.arguments.insert(func.arguments.begin(), LogicalType::INTEGER);    // num_sectors
-		func.arguments.insert(func.arguments.begin(), LogicalType::VARCHAR);    // version
+		func.arguments.insert(func.arguments.begin(), LogicalType::INTEGER); // num_sectors
+		func.arguments.insert(func.arguments.begin(), LogicalType::VARCHAR); // version
 		agg_func.AddFunction(func);
 
 		CreateAggregateFunctionInfo info(agg_func);
@@ -690,8 +700,11 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		                   "Use bitfilters_duckdb_hash() to hash values first. "
 		                   "The version and num_sectors (power of 2) are constants. "
 		                   "Returns a BLOB that can be probed with bitfilters_duckdb_bloom_filter_probe.";
-		desc.examples.push_back(
-		    "SELECT bitfilters_duckdb_bloom_filter_create('v1.5.1', 16384, bitfilters_duckdb_hash('v1.5.1', key)) FROM tbl");
+		desc.parameter_names = {"version", "num_sectors", "hashed_value"};
+		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::UBIGINT};
+		desc.examples.push_back("SELECT bitfilters_duckdb_bloom_filter_create('v1.5.1', 16384, "
+		                        "bitfilters_duckdb_hash('v1.5.1', key)) FROM tbl");
+		desc.categories = {"bitfilters", "probabilistic"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(info);
 	}
