@@ -6,6 +6,8 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
+#include "duckdb/common/vector/constant_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "vendor/fastfilter/binaryfusefilter.h"
 
 namespace duckdb {
@@ -322,9 +324,12 @@ struct BinaryFuseFilterCreateOperation {
 template <typename T, typename FilterType>
 auto static BinaryFuseFilterCreateAggregate(const LogicalType &type, const LogicalType &result_type)
     -> AggregateFunction {
-	return AggregateFunction::UnaryAggregateDestructor<BinaryFuseFilterState, T, string_t,
-	                                                   BinaryFuseFilterCreateOperation<FilterType>,
-	                                                   AggregateDestructorType::LEGACY>(type, result_type);
+	auto aggregate =
+	    AggregateFunction::UnaryAggregate<BinaryFuseFilterState, T, string_t,
+	                                      BinaryFuseFilterCreateOperation<FilterType>, AggregateDestructorType::LEGACY>(
+	        type, result_type);
+	aggregate.SetFallible();
+	return aggregate;
 }
 
 template <class T, typename FilterType>
@@ -345,7 +350,7 @@ static inline void BinaryFuseFilterContains(DataChunk &args, ExpressionState &st
 		FilterType deserialized_filter;
 		DeserializeFilter(deserialized_filter, ConstantVector::GetData<string_t>(filter_vector)[0]);
 
-		UnaryExecutor::Execute<T, bool>(item_vector, result, args.size(),
+		UnaryExecutor::Execute<T, bool>(item_vector, result,
 		                                [&](T item_data) { return Traits::Contains(item_data, &deserialized_filter); });
 		return;
 	}
@@ -359,7 +364,7 @@ static inline void BinaryFuseFilterContains(DataChunk &args, ExpressionState &st
 	const char *cached_data = nullptr;
 	uint32_t cached_size = 0;
 	BinaryExecutor::Execute<string_t, T, bool>(
-	    filter_vector, item_vector, result, args.size(), [&](string_t filter_data, T item_data) {
+	    filter_vector, item_vector, result, [&](string_t filter_data, T item_data) {
 		    if (filter_data.GetData() != cached_data || filter_data.GetSize() != cached_size) {
 			    DeserializeFilter(deserialized_filter, filter_data);
 			    cached_data = filter_data.GetData();
@@ -424,6 +429,7 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet fs("binary_fuse16_filter_contains");
 		RegisterBinaryFuseFilterContainsForType<uint64_t, binary_fuse16_t>(fs, LogicalType::UBIGINT);
+		fs.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fs));
 		{
 			FunctionDescription desc;
@@ -442,6 +448,7 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet fs("binary_fuse8_filter_contains");
 		RegisterBinaryFuseFilterContainsForType<uint64_t, binary_fuse8_t>(fs, LogicalType::UBIGINT);
+		fs.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fs));
 		{
 			FunctionDescription desc;

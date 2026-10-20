@@ -10,6 +10,11 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/vector/constant_vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/unified_vector_format.hpp"
+#include "bitfilters_aggregate_util.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -192,7 +197,7 @@ static void HashVectorTyped(UnifiedVectorFormat &vdata, uint64_t *result, idx_t 
 // Uses UnifiedVectorFormat to handle flat, constant, and dictionary vectors.
 static void HashVector_v1_5(Vector &vec, uint64_t *result, idx_t count) {
 	UnifiedVectorFormat vdata;
-	vec.ToUnifiedFormat(count, vdata);
+	vec.ToUnifiedFormat(vdata);
 
 	switch (vec.GetType().InternalType()) {
 	case PhysicalType::BOOL:
@@ -279,8 +284,9 @@ struct DuckDbHashBindData : public FunctionData {
 	}
 };
 
-static unique_ptr<FunctionData> DuckDbHashBind(ClientContext &context, ScalarFunction &function,
-                                               vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<FunctionData> DuckDbHashBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
 	if (arguments.empty()) {
 		throw BinderException("bitfilters_duckdb_hash requires at least 2 arguments: version and value(s)");
 	}
@@ -302,11 +308,11 @@ static unique_ptr<FunctionData> DuckDbHashBind(ClientContext &context, ScalarFun
 
 static void DuckDbHashFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = func_expr.bind_info->Cast<DuckDbHashBindData>();
+	auto &bind_data = func_expr.BindInfo()->Cast<DuckDbHashBindData>();
 	(void)bind_data; // version checked at bind time; all v1.5.x use same impl
 
 	auto count = args.size();
-	auto result_data = FlatVector::GetData<uint64_t>(result);
+	auto result_data = FlatVector::GetDataMutable<uint64_t>(result);
 
 	// args.data[0] is the version string, which stays in the argument list: the
 	// binder re-verifies bound functions against their registered signature in
@@ -381,8 +387,9 @@ struct DuckDbBloomFilterProbeBindData : public FunctionData {
 	}
 };
 
-static unique_ptr<FunctionData> DuckDbBloomFilterProbeBind(ClientContext &context, ScalarFunction &function,
-                                                           vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<FunctionData> DuckDbBloomFilterProbeBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
 	if (arguments.size() < 3) {
 		throw BinderException("bitfilters_duckdb_bloom_filter_probe requires at least 3 arguments: "
 		                      "version, filter_blob, value(s)");
@@ -422,10 +429,10 @@ static unique_ptr<FunctionData> DuckDbBloomFilterProbeBind(ClientContext &contex
 
 static void DuckDbBloomFilterProbeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = func_expr.bind_info->Cast<DuckDbBloomFilterProbeBindData>();
+	auto &bind_data = func_expr.BindInfo()->Cast<DuckDbBloomFilterProbeBindData>();
 
 	auto count = args.size();
-	auto result_data = FlatVector::GetData<bool>(result);
+	auto result_data = FlatVector::GetDataMutable<bool>(result);
 
 	// args.data[0] is the version and args.data[1] the filter blob; values follow
 	D_ASSERT(args.ColumnCount() >= 3);
@@ -585,8 +592,9 @@ struct DuckDbBloomFilterCreateOperation {
 	}
 };
 
-static unique_ptr<FunctionData> DuckDbBloomFilterCreateBind(ClientContext &context, AggregateFunction &function,
-                                                            vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<FunctionData> DuckDbBloomFilterCreateBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
 	if (arguments.size() < 3) {
 		throw BinderException("bitfilters_duckdb_bloom_filter_create requires at least 3 arguments: "
 		                      "version, num_sectors, value(s)");
@@ -616,17 +624,17 @@ static unique_ptr<FunctionData> DuckDbBloomFilterCreateBind(ClientContext &conte
 		                      num_sectors);
 	}
 
-	Function::EraseArgument(function, arguments, 0); // version
-	Function::EraseArgument(function, arguments, 0); // num_sectors
+	// The version and num_sectors arguments stay in the argument list (DuckDB 2.0
+	// no longer allows erasing arguments); the update callback skips them.
 
 	return make_uniq<DuckDbBloomFilterCreateBindData>(version, num_sectors);
 }
 
 template <typename T>
 static AggregateFunction CreateBloomFilterAggregate(const LogicalType &type) {
-	return AggregateFunction::UnaryAggregateDestructor<
-	    DuckDbBloomFilterCreateState, T, string_t, DuckDbBloomFilterCreateOperation, AggregateDestructorType::LEGACY>(
-	    type, LogicalType::BLOB);
+	return BitfiltersUnaryAggregateWithLeadingArgs<2, DuckDbBloomFilterCreateState, T, string_t,
+	                                               DuckDbBloomFilterCreateOperation, AggregateDestructorType::LEGACY>(
+	    {LogicalType::VARCHAR, LogicalType::INTEGER}, type, LogicalType::BLOB);
 }
 
 } // namespace
@@ -640,10 +648,11 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet fs("bitfilters_duckdb_hash");
 		// Single argument with version (version is erased at bind time, so we register with VARCHAR + varargs)
-		auto func = ScalarFunction({LogicalType::VARCHAR}, LogicalType::UBIGINT, DuckDbHashFunction, DuckDbHashBind);
-		func.varargs = LogicalType::ANY;
+		auto func = ScalarFunction({LogicalType::VARCHAR}, LogicalType::UBIGINT, DuckDbHashFunction, DuckDbHashBind,
+		                           nullptr, nullptr, LogicalType::ANY);
 		fs.AddFunction(func);
 
+		fs.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fs));
 		FunctionDescription desc;
 		desc.description = "Computes the DuckDB-internal hash value for the given DuckDB version. "
@@ -663,10 +672,11 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet fs("bitfilters_duckdb_bloom_filter_probe");
 		auto func = ScalarFunction({LogicalType::VARCHAR, LogicalType::BLOB}, LogicalType::BOOLEAN,
-		                           DuckDbBloomFilterProbeFunction, DuckDbBloomFilterProbeBind);
-		func.varargs = LogicalType::ANY;
+		                           DuckDbBloomFilterProbeFunction, DuckDbBloomFilterProbeBind, nullptr, nullptr,
+		                           LogicalType::ANY);
 		fs.AddFunction(func);
 
+		fs.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fs));
 		FunctionDescription desc;
 		desc.description = "Probes a DuckDB-internal bloom filter (serialized as BLOB) for a value. "
@@ -689,9 +699,8 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		AggregateFunctionSet agg_func("bitfilters_duckdb_bloom_filter_create");
 
 		auto func = CreateBloomFilterAggregate<uint64_t>(LogicalType::UBIGINT);
-		func.bind = DuckDbBloomFilterCreateBind;
-		func.arguments.insert(func.arguments.begin(), LogicalType::INTEGER); // num_sectors
-		func.arguments.insert(func.arguments.begin(), LogicalType::VARCHAR); // version
+		func.SetBindCallback(DuckDbBloomFilterCreateBind);
+		func.SetFallible();
 		agg_func.AddFunction(func);
 
 		CreateAggregateFunctionInfo info(agg_func);

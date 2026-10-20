@@ -12,7 +12,7 @@ require bitfilters
 foreach n 1 2 3 4 5 17 100 1000 40000
 
 statement ok
-create or replace table sample as select hash(i) as k from range(${n}) t(i);
+create or replace table sample as select hash(i) as k from range({n}) t(i);
 
 statement ok
 create or replace table filters as

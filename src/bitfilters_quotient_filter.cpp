@@ -7,6 +7,9 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
+#include "duckdb/common/vector/constant_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "bitfilters_aggregate_util.hpp"
 #include "vendor/quotient-filter/quotient_filter.hpp"
 
 namespace duckdb {
@@ -43,11 +46,9 @@ struct QuotientFilterBindData : public FunctionData {
 	uint32_t r;
 };
 
-unique_ptr<FunctionData> QuotientFilterBind(ClientContext &context, AggregateFunction &function,
-                                            vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() == 1) {
-		return nullptr;
-	}
+unique_ptr<FunctionData> QuotientFilterBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
 	if (arguments.size() > 3) {
 		throw BinderException("Quotient filter aggregate function requires exactly 3 arguments");
 	}
@@ -99,9 +100,8 @@ unique_ptr<FunctionData> QuotientFilterBind(ClientContext &context, AggregateFun
 		                      actual_q, actual_r, filter_bytes, NumericLimits<uint32_t>::Maximum());
 	}
 
-	// So doing this causes problems.
-	Function::EraseArgument(function, arguments, 0);
-	Function::EraseArgument(function, arguments, 0);
+	// The q and r arguments stay in the argument list (DuckDB 2.0 no longer allows
+	// erasing arguments); the update callback skips them.
 
 	return make_uniq<QuotientFilterBindData>(actual_q, actual_r);
 }
@@ -244,17 +244,19 @@ template <typename T>
 auto static QuotientFilterMergeAggregate(const LogicalType &type, const LogicalType &result_type) -> AggregateFunction
 
 {
-	return AggregateFunction::UnaryAggregateDestructor<QuotientFilterState<T>, string_t, string_t,
-	                                                   QuotientFilterMergeOperation<QuotientFilterBindData>,
-	                                                   AggregateDestructorType::LEGACY>(result_type, result_type);
+	return BitfiltersUnaryAggregateWithLeadingArgs<2, QuotientFilterState<T>, string_t, string_t,
+	                                               QuotientFilterMergeOperation<QuotientFilterBindData>,
+	                                               AggregateDestructorType::LEGACY>(
+	    {LogicalType::INTEGER, LogicalType::INTEGER}, result_type, result_type);
 }
 
 template <typename T>
 auto static QuotientFilterCreateAggregate(const LogicalType &type, const LogicalType &result_type)
     -> AggregateFunction {
-	return AggregateFunction::UnaryAggregateDestructor<QuotientFilterState<T>, T, string_t,
-	                                                   QuotientFilterCreateOperation<QuotientFilterBindData>,
-	                                                   AggregateDestructorType::LEGACY>(type, result_type);
+	return BitfiltersUnaryAggregateWithLeadingArgs<2, QuotientFilterState<T>, T, string_t,
+	                                               QuotientFilterCreateOperation<QuotientFilterBindData>,
+	                                               AggregateDestructorType::LEGACY>(
+	    {LogicalType::INTEGER, LogicalType::INTEGER}, type, result_type);
 }
 
 template <class T>
@@ -275,7 +277,7 @@ static inline void QuotientFilterContains(DataChunk &args, ExpressionState &stat
 		auto &blob = ConstantVector::GetData<string_t>(filter_vector)[0];
 		// The constructor validates the BLOB and throws if it is not one of ours.
 		QuotientFilter filter(blob.GetData(), blob.GetSize());
-		UnaryExecutor::Execute<T, bool>(item_vector, result, args.size(),
+		UnaryExecutor::Execute<T, bool>(item_vector, result,
 		                                [&](T item_data) { return filter.may_contain(item_data); });
 		return;
 	}
@@ -290,7 +292,7 @@ static inline void QuotientFilterContains(DataChunk &args, ExpressionState &stat
 	const char *cached_data = nullptr;
 	uint32_t cached_size = 0;
 	BinaryExecutor::Execute<string_t, T, bool>(
-	    filter_vector, item_vector, result, args.size(), [&](string_t filter_data, T item_data) {
+	    filter_vector, item_vector, result, [&](string_t filter_data, T item_data) {
 		    if (!cached_filter || filter_data.GetData() != cached_data || filter_data.GetSize() != cached_size) {
 			    cached_filter = make_uniq<QuotientFilter>(filter_data.GetData(), filter_data.GetSize());
 			    cached_data = filter_data.GetData();
@@ -306,18 +308,16 @@ static void RegisterQuotientFilterFunctionsForType(AggregateFunctionSet &Quotien
 	// Register create aggregate function
 	{
 		auto fun = QuotientFilterCreateAggregate<T>(type, LogicalType::BLOB);
-		fun.bind = QuotientFilterBind;
-		fun.arguments.insert(fun.arguments.begin(), LogicalType::INTEGER);
-		fun.arguments.insert(fun.arguments.begin(), LogicalType::INTEGER);
+		fun.SetBindCallback(QuotientFilterBind);
+		fun.SetFallible();
 		Quotientfilter.AddFunction(fun);
 	}
 
 	// Register merge aggregate function
 	{
 		auto fun = QuotientFilterMergeAggregate<T>(type, LogicalType::BLOB);
-		fun.bind = QuotientFilterBind;
-		fun.arguments.insert(fun.arguments.begin(), LogicalType::INTEGER);
-		fun.arguments.insert(fun.arguments.begin(), LogicalType::INTEGER);
+		fun.SetBindCallback(QuotientFilterBind);
+		fun.SetFallible();
 		Quotientfilter.AddFunction(fun);
 	}
 }
@@ -359,6 +359,7 @@ void LoadQuotientFilter(ExtensionLoader &loader) {
 
 		RegisterQuotientFilterContainsForType<uint64_t>(fs, LogicalType::UBIGINT);
 
+		fs.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fs));
 
 		{
