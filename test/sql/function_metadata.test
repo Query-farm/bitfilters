@@ -7,16 +7,17 @@ require bitfilters
 # Every overload, including the BLOB (merge) overload of quotient_filter, has a
 # description, examples, categories and real parameter names (descriptions
 # only attach to overloads whose parameter_types match, and names come from
-# the signature, which defaults to col0, col1, ...).
+# the signature, which defaults to col0, col1, ...). Functions are matched by
+# name since extension_name is NULL when the extension is linked statically.
 query I
-SELECT count(*) FROM duckdb_functions() WHERE extension_name = 'bitfilters'
+SELECT count(*) FROM duckdb_functions() WHERE regexp_matches(function_name, '^((binary_fuse|xor)(8|16)|quotient)_filter(_contains)?$|^bitfilters_')
 ----
 14
 
 query IIII
 SELECT function_name, function_type, parameters, parameter_types
 FROM duckdb_functions()
-WHERE extension_name = 'bitfilters'
+WHERE regexp_matches(function_name, '^((binary_fuse|xor)(8|16)|quotient)_filter(_contains)?$|^bitfilters_')
   AND (description IS NULL OR description = ''
        OR examples IS NULL OR len(examples) = 0
        OR categories IS NULL OR len(categories) = 0
