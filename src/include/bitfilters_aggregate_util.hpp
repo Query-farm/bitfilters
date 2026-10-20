@@ -2,6 +2,8 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/aggregate_function.hpp"
+#include "duckdb/function/function_set.hpp"
+#include "duckdb/parser/parsed_data/create_function_info.hpp"
 
 namespace duckdb {
 
@@ -32,6 +34,48 @@ static AggregateFunction BitfiltersUnaryAggregateWithLeadingArgs(const vector<Lo
 	    AggregateFunction::StateFinalize<STATE, RESULT_TYPE, OP>, FunctionNullHandling::DEFAULT_NULL_HANDLING);
 	result.SetStateDestructorCallback(AggregateFunction::StateDestroy<STATE, OP>);
 	return result;
+}
+
+// DuckDB 2.0 takes the parameter names shown by duckdb_functions() from each
+// overload's signature, and a plain type list names them col0, col1, ...
+// FunctionDescription.parameter_names alone no longer reaches the output.
+// This names every overload in the set from the description whose
+// parameter_types match that overload's (non-variadic) parameters, so the
+// names live in one place. It throws if an overload has no matching
+// description, which would otherwise leave it undocumented in
+// duckdb_functions() (descriptions only attach to overloads whose types match).
+template <class FUNCTION_SET>
+static void BitfiltersApplyParameterNames(FUNCTION_SET &set, const vector<FunctionDescription> &descriptions) {
+	set.ApplyToFunctions([&](auto &fun) {
+		auto &signature = fun.GetSignature();
+		vector<idx_t> positional;
+		for (idx_t i = 0; i < signature.GetParameterCount(); i++) {
+			if (!signature.GetParameter(i).IsVariadic()) {
+				positional.push_back(i);
+			}
+		}
+		for (auto &desc : descriptions) {
+			if (desc.parameter_types.size() != positional.size() || desc.parameter_names.size() != positional.size()) {
+				continue;
+			}
+			bool matches = true;
+			for (idx_t i = 0; i < positional.size(); i++) {
+				if (desc.parameter_types[i] != signature.GetParameter(positional[i]).GetType()) {
+					matches = false;
+					break;
+				}
+			}
+			if (!matches) {
+				continue;
+			}
+			for (idx_t i = 0; i < positional.size(); i++) {
+				signature.GetParameter(positional[i]).SetName(Identifier(desc.parameter_names[i]));
+			}
+			return;
+		}
+		throw InternalException("bitfilters: no FunctionDescription matches overload %s of %s", signature.ToString(),
+		                        set.name);
+	});
 }
 
 } // namespace duckdb

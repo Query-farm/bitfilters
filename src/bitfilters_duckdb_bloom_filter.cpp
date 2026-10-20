@@ -667,12 +667,14 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		                   "The hash matches DuckDB's built-in hash() function for that version. "
 		                   "Multiple values are combined using the version's CombineHash algorithm. "
 		                   "Supported versions: v1.4.0-v1.4.4, v1.5.0, v1.5.1, v1.6.0, v2.0.";
-		desc.parameter_names = {"version", "value"};
-		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::ANY};
+		// The values to hash are variadic (ANY); duckdb_functions() lists only the fixed parameters.
+		desc.parameter_names = {"version"};
+		desc.parameter_types = {LogicalType::VARCHAR};
 		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v2.0', 42)");
 		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v2.0', col1, col2) FROM tbl");
 		desc.categories = {"bitfilters", "hash"};
 		info.descriptions.push_back(desc);
+		BitfiltersApplyParameterNames(info.functions, info.descriptions);
 		loader.RegisterFunction(info);
 	}
 
@@ -691,13 +693,15 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		                   "The version parameter specifies which DuckDB hash algorithm to use. "
 		                   "The filter blob and version are constant-folded at bind time. "
 		                   "Multiple value arguments are combined for multi-key bloom filter probes.";
-		desc.parameter_names = {"version", "filter_blob", "value"};
-		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY};
+		// The values to probe are variadic (ANY); duckdb_functions() lists only the fixed parameters.
+		desc.parameter_names = {"version", "filter_blob"};
+		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::BLOB};
 		desc.examples.push_back("SELECT bitfilters_duckdb_bloom_filter_probe('v2.0', filter_blob, key_col) FROM tbl");
 		desc.examples.push_back(
 		    "SELECT bitfilters_duckdb_bloom_filter_probe('v2.0', filter_blob, col1, col2) FROM tbl");
 		desc.categories = {"bitfilters", "probabilistic"};
 		info.descriptions.push_back(desc);
+		BitfiltersApplyParameterNames(info.functions, info.descriptions);
 		loader.RegisterFunction(info);
 	}
 
@@ -723,6 +727,7 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		                        "bitfilters_duckdb_hash('v2.0', key)) FROM tbl");
 		desc.categories = {"bitfilters", "probabilistic"};
 		info.descriptions.push_back(desc);
+		BitfiltersApplyParameterNames(info.functions, info.descriptions);
 		loader.RegisterFunction(info);
 	}
 }

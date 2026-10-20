@@ -6,6 +6,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
+#include "bitfilters_aggregate_util.hpp"
 #include "duckdb/common/vector/constant_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
 #include "vendor/fastfilter/binaryfusefilter.h"
@@ -405,6 +406,8 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 			desc.categories = {"bitfilters", "probabilistic"};
 			BinaryFusefilter_create_info.descriptions.push_back(desc);
 		}
+		BitfiltersApplyParameterNames(BinaryFusefilter_create_info.functions,
+		                              BinaryFusefilter_create_info.descriptions);
 		loader.RegisterFunction(BinaryFusefilter_create_info);
 	}
 
@@ -422,6 +425,8 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 			desc.categories = {"bitfilters", "probabilistic"};
 			BinaryFusefilter_create_info.descriptions.push_back(desc);
 		}
+		BitfiltersApplyParameterNames(BinaryFusefilter_create_info.functions,
+		                              BinaryFusefilter_create_info.descriptions);
 		loader.RegisterFunction(BinaryFusefilter_create_info);
 	}
 
@@ -442,6 +447,7 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
+		BitfiltersApplyParameterNames(info.functions, info.descriptions);
 		loader.RegisterFunction(info);
 	}
 
@@ -461,6 +467,7 @@ void LoadBinaryFuseFilter(ExtensionLoader &loader) {
 			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
+		BitfiltersApplyParameterNames(info.functions, info.descriptions);
 		loader.RegisterFunction(info);
 	}
 }

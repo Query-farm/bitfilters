@@ -340,16 +340,32 @@ void LoadQuotientFilter(ExtensionLoader &loader) {
 
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Quotient filter by aggregating values or by merging other Quotient filters. "
+			desc.description = "Creates a Quotient filter by aggregating UBIGINT values. "
 			                   "q is the number of quotient bits (controls capacity, ~2^q slots) and r is the number "
-			                   "of remainder bits (controls false positive rate, ~2^-r). q + r must be <= 64.";
+			                   "of remainder bits (controls false positive rate, ~2^-r). q + r must be <= 64. "
+			                   "Returns a BLOB to probe with quotient_filter_contains.";
 			desc.parameter_names = {"q", "r", "value"};
 			desc.parameter_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::UBIGINT};
-			desc.examples.push_back("SELECT quotient_filter(16, 8, column) FROM table");
+			desc.examples.push_back("SELECT quotient_filter(16, 8, hash(column)) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
+			Quotientfilter_create_info.descriptions.push_back(desc);
+		}
+		{
+			// The merge overload takes filter BLOBs instead of values; duckdb_functions()
+			// only attaches a description whose parameter_types match the overload.
+			FunctionDescription desc;
+			desc.description = "Merges Quotient filters (BLOBs produced by quotient_filter) into a single filter "
+			                   "containing every value of the inputs. q and r size the merged filter; it uses the "
+			                   "larger of these and each input's quotient and remainder bits, so q must leave room "
+			                   "for all merged values. q + r must be <= 64.";
+			desc.parameter_names = {"q", "r", "filter"};
+			desc.parameter_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BLOB};
+			desc.examples.push_back("SELECT quotient_filter(16, 8, filter) FROM filters");
 			desc.categories = {"bitfilters", "probabilistic"};
 			Quotientfilter_create_info.descriptions.push_back(desc);
 		}
 
+		BitfiltersApplyParameterNames(Quotientfilter_create_info.functions, Quotientfilter_create_info.descriptions);
 		loader.RegisterFunction(Quotientfilter_create_info);
 	}
 
@@ -374,6 +390,7 @@ void LoadQuotientFilter(ExtensionLoader &loader) {
 			info.descriptions.push_back(desc);
 		}
 
+		BitfiltersApplyParameterNames(info.functions, info.descriptions);
 		loader.RegisterFunction(info);
 	}
 }

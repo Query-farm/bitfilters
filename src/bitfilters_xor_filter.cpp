@@ -6,6 +6,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
+#include "bitfilters_aggregate_util.hpp"
 #include "duckdb/common/vector/constant_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
 #include "vendor/fastfilter/xorfilter.h"
@@ -363,6 +364,7 @@ void LoadXorFilter(ExtensionLoader &loader) {
 			desc.categories = {"bitfilters", "probabilistic"};
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
+		BitfiltersApplyParameterNames(Xorfilter_create_info.functions, Xorfilter_create_info.descriptions);
 		loader.RegisterFunction(Xorfilter_create_info);
 	}
 
@@ -380,6 +382,7 @@ void LoadXorFilter(ExtensionLoader &loader) {
 			desc.categories = {"bitfilters", "probabilistic"};
 			Xorfilter_create_info.descriptions.push_back(desc);
 		}
+		BitfiltersApplyParameterNames(Xorfilter_create_info.functions, Xorfilter_create_info.descriptions);
 		loader.RegisterFunction(Xorfilter_create_info);
 	}
 
@@ -400,6 +403,7 @@ void LoadXorFilter(ExtensionLoader &loader) {
 			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
+		BitfiltersApplyParameterNames(info.functions, info.descriptions);
 		loader.RegisterFunction(info);
 	}
 
@@ -419,6 +423,7 @@ void LoadXorFilter(ExtensionLoader &loader) {
 			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
+		BitfiltersApplyParameterNames(info.functions, info.descriptions);
 		loader.RegisterFunction(info);
 	}
 }
