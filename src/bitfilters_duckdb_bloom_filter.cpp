@@ -33,6 +33,10 @@ enum class DuckDbHashVersion {
 	// The only difference is v1.5.x added explicit little-endian loads (LoadLE/BSwapIfBE)
 	// which only affects big-endian platforms. On x86/ARM64 (little-endian), all versions
 	// produce identical hash values.
+	// v2.0 keeps the same Hash<T>/MurmurHash64/HashBytes/CombineHashScalar algorithms
+	// (src/common/types/hash.cpp, src/common/vector_operations/vector_hash.cpp) and the
+	// same bloom filter sector/mask layout (src/planner/filter/table_filter_bloom_function.cpp),
+	// so it maps to the same implementation.
 	V1_4_0, // v1.4.0
 	V1_4_1, // v1.4.1
 	V1_4_2, // v1.4.2
@@ -41,6 +45,7 @@ enum class DuckDbHashVersion {
 	V1_5_0, // v1.5.0
 	V1_5_1, // v1.5.1
 	V1_6_0, // v1.6.0
+	V2_0,   // v2.0
 };
 
 static DuckDbHashVersion ParseVersion(const string &version_str) {
@@ -68,8 +73,11 @@ static DuckDbHashVersion ParseVersion(const string &version_str) {
 	if (version_str == "v1.6.0" || version_str == "1.6.0") {
 		return DuckDbHashVersion::V1_6_0;
 	}
+	if (version_str == "v2.0" || version_str == "2.0" || version_str == "v2.0.0" || version_str == "2.0.0") {
+		return DuckDbHashVersion::V2_0;
+	}
 	throw BinderException("Unsupported DuckDB version '%s' for bitfilters DuckDB hash/bloom filter. "
-	                      "Supported versions: v1.4.0-v1.4.4, v1.5.0, v1.5.1, v1.6.0",
+	                      "Supported versions: v1.4.0-v1.4.4, v1.5.0, v1.5.1, v1.6.0, v2.0",
 	                      version_str);
 }
 
@@ -309,7 +317,7 @@ static unique_ptr<FunctionData> DuckDbHashBind(BindScalarFunctionInput &input) {
 static void DuckDbHashFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = func_expr.BindInfo()->Cast<DuckDbHashBindData>();
-	(void)bind_data; // version checked at bind time; all v1.5.x use same impl
+	(void)bind_data; // version checked at bind time; v1.4.x-v2.0 all use the same impl
 
 	auto count = args.size();
 	auto result_data = FlatVector::GetDataMutable<uint64_t>(result);
@@ -658,11 +666,11 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		desc.description = "Computes the DuckDB-internal hash value for the given DuckDB version. "
 		                   "The hash matches DuckDB's built-in hash() function for that version. "
 		                   "Multiple values are combined using the version's CombineHash algorithm. "
-		                   "Supported versions: v1.4.0-v1.4.4, v1.5.0, v1.5.1, v1.6.0.";
+		                   "Supported versions: v1.4.0-v1.4.4, v1.5.0, v1.5.1, v1.6.0, v2.0.";
 		desc.parameter_names = {"version", "value"};
 		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::ANY};
-		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v1.5.1', 42)");
-		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v1.5.1', col1, col2) FROM tbl");
+		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v2.0', 42)");
+		desc.examples.push_back("SELECT bitfilters_duckdb_hash('v2.0', col1, col2) FROM tbl");
 		desc.categories = {"bitfilters", "hash"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(info);
@@ -685,9 +693,9 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		                   "Multiple value arguments are combined for multi-key bloom filter probes.";
 		desc.parameter_names = {"version", "filter_blob", "value"};
 		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY};
-		desc.examples.push_back("SELECT bitfilters_duckdb_bloom_filter_probe('v1.5.1', filter_blob, key_col) FROM tbl");
+		desc.examples.push_back("SELECT bitfilters_duckdb_bloom_filter_probe('v2.0', filter_blob, key_col) FROM tbl");
 		desc.examples.push_back(
-		    "SELECT bitfilters_duckdb_bloom_filter_probe('v1.5.1', filter_blob, col1, col2) FROM tbl");
+		    "SELECT bitfilters_duckdb_bloom_filter_probe('v2.0', filter_blob, col1, col2) FROM tbl");
 		desc.categories = {"bitfilters", "probabilistic"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(info);
@@ -711,8 +719,8 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		                   "Returns a BLOB that can be probed with bitfilters_duckdb_bloom_filter_probe.";
 		desc.parameter_names = {"version", "num_sectors", "hashed_value"};
 		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::UBIGINT};
-		desc.examples.push_back("SELECT bitfilters_duckdb_bloom_filter_create('v1.5.1', 16384, "
-		                        "bitfilters_duckdb_hash('v1.5.1', key)) FROM tbl");
+		desc.examples.push_back("SELECT bitfilters_duckdb_bloom_filter_create('v2.0', 16384, "
+		                        "bitfilters_duckdb_hash('v2.0', key)) FROM tbl");
 		desc.categories = {"bitfilters", "probabilistic"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(info);
