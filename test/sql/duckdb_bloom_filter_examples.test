@@ -1,0 +1,72 @@
+# name: test/sql/duckdb_bloom_filter_examples.test
+# description: the bitfilters_duckdb_bloom_filter_probe examples run, and the filter may be a subquery or a per-row column
+# group: [bitfilters]
+
+require bitfilters
+
+# The examples registered in the function description. If an example changes, update it here too.
+query I
+SELECT unnest(examples) FROM duckdb_functions() WHERE function_name = 'bitfilters_duckdb_bloom_filter_probe' ORDER BY ALL;
+----
+SELECT key_col, bitfilters_duckdb_bloom_filter_probe('v2.0', (SELECT bitfilters_duckdb_bloom_filter_create('v2.0', 1024, bitfilters_duckdb_hash('v2.0', k)) FROM range(100) t(k)), key_col) AS maybe_present FROM range(98, 102) t(key_col)
+WITH f AS (SELECT bitfilters_duckdb_bloom_filter_create('v2.0', 1024, bitfilters_duckdb_hash('v2.0', i, 'k' || i)) AS filter_blob FROM range(100) t(i)) SELECT col1, col2, bitfilters_duckdb_bloom_filter_probe('v2.0', (SELECT filter_blob FROM f), col1, col2) AS maybe_present FROM (VALUES (1::BIGINT, 'k1'), (1, 'k2'), (200, 'k200')) t(col1, col2)
+
+# Example 1: the filter is an uncorrelated scalar subquery
+query II
+SELECT key_col, bitfilters_duckdb_bloom_filter_probe('v2.0', (SELECT bitfilters_duckdb_bloom_filter_create('v2.0', 1024, bitfilters_duckdb_hash('v2.0', k)) FROM range(100) t(k)), key_col) AS maybe_present FROM range(98, 102) t(key_col)
+----
+98	true
+99	true
+100	false
+101	false
+
+# Example 2: multi-key probe, filter from a CTE
+query III
+WITH f AS (SELECT bitfilters_duckdb_bloom_filter_create('v2.0', 1024, bitfilters_duckdb_hash('v2.0', i, 'k' || i)) AS filter_blob FROM range(100) t(i)) SELECT col1, col2, bitfilters_duckdb_bloom_filter_probe('v2.0', (SELECT filter_blob FROM f), col1, col2) AS maybe_present FROM (VALUES (1::BIGINT, 'k1'), (1, 'k2'), (200, 'k200')) t(col1, col2)
+----
+1	k1	true
+1	k2	false
+200	k200	false
+
+# A scalar-subquery filter over many chunks finds every inserted key
+query I
+SELECT count(*) FILTER (WHERE bitfilters_duckdb_bloom_filter_probe('v2.0', (SELECT bitfilters_duckdb_bloom_filter_create('v2.0', 1024, bitfilters_duckdb_hash('v2.0', i)) FROM range(100) t(i)), i)) >= 100
+FROM range(100000) t(i);
+----
+true
+
+# A filter column: each row is probed against its own filter
+statement ok
+CREATE TABLE filters AS
+SELECT i // 10 AS g, bitfilters_duckdb_bloom_filter_create('v2.0', 64, bitfilters_duckdb_hash('v2.0', i)) AS f
+FROM range(20) t(i) GROUP BY ALL;
+
+query II
+SELECT g, count(*) FILTER (WHERE bitfilters_duckdb_bloom_filter_probe('v2.0', f, i))
+FROM filters, range(20) t(i) WHERE i // 10 = g GROUP BY g ORDER BY g;
+----
+0	10
+1	10
+
+# Same answers as probing each filter as a constant
+query I
+SELECT bool_and(bitfilters_duckdb_bloom_filter_probe('v2.0', f, i) =
+                CASE g WHEN 0 THEN bitfilters_duckdb_bloom_filter_probe('v2.0', (SELECT f FROM filters WHERE g = 0), i)
+                       ELSE bitfilters_duckdb_bloom_filter_probe('v2.0', (SELECT f FROM filters WHERE g = 1), i) END)
+FROM filters, range(1000) t(i);
+----
+true
+
+# A NULL filter in a row yields NULL for that row
+query II
+SELECT i, bitfilters_duckdb_bloom_filter_probe('v2.0', CASE WHEN i = 3 THEN NULL ELSE f END, i)
+FROM filters, range(2, 4) t(i) WHERE g = 0 ORDER BY i;
+----
+2	true
+3	NULL
+
+# An invalid filter is still rejected
+statement error
+SELECT bitfilters_duckdb_bloom_filter_probe('v2.0', b, 1) FROM (VALUES ('\x01'::BLOB)) t(b);
+----
+filter blob too short

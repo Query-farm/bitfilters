@@ -435,6 +435,12 @@ static unique_ptr<FunctionData> DuckDbBloomFilterProbeBind(BindScalarFunctionInp
 	return make_uniq<DuckDbBloomFilterProbeBindData>(version, blob_str, filter_is_constant);
 }
 
+static inline bool ProbeDuckDbBloomFilter(const uint64_t *sectors, uint64_t bitmask, uint64_t h) {
+	auto sector_idx = h & bitmask;
+	auto mask = GetMask_v1_5(h);
+	return (sectors[sector_idx] & mask) == mask;
+}
+
 static void DuckDbBloomFilterProbeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = func_expr.BindInfo()->Cast<DuckDbBloomFilterProbeBindData>();
@@ -446,28 +452,6 @@ static void DuckDbBloomFilterProbeFunction(DataChunk &args, ExpressionState &sta
 	D_ASSERT(args.ColumnCount() >= 3);
 	const idx_t value_start = 2;
 
-	// For non-constant filter, parse from the filter column
-	const uint64_t *sectors;
-	uint64_t bitmask;
-	// Holds parsed blob data for the non-constant case (must outlive the probe loop)
-	unique_ptr<DuckDbBloomFilterProbeBindData> runtime_bd;
-	if (!bind_data.filter_is_constant) {
-		// The filter must be constant across the chunk or we cannot parse it once
-		auto &filter_vec = args.data[1];
-		if (filter_vec.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-			auto filter_str = ConstantVector::GetData<string_t>(filter_vec)[0];
-			runtime_bd = make_uniq<DuckDbBloomFilterProbeBindData>(bind_data.version, filter_str.GetString(), true);
-			sectors = runtime_bd->sectors;
-			bitmask = runtime_bd->bitmask;
-		} else {
-			throw InvalidInputException(
-			    "bitfilters_duckdb_bloom_filter_probe: filter blob must be constant across rows");
-		}
-	} else {
-		sectors = bind_data.sectors;
-		bitmask = bind_data.bitmask;
-	}
-
 	// Hash all value columns into a temp buffer
 	auto hashes = unique_ptr<uint64_t[]>(new uint64_t[count]);
 	HashVector_v1_5(args.data[value_start], hashes.get(), count);
@@ -475,12 +459,38 @@ static void DuckDbBloomFilterProbeFunction(DataChunk &args, ExpressionState &sta
 		CombineHashVector_v1_5(args.data[col_idx], hashes.get(), count);
 	}
 
-	// Probe bloom filter for each hash
+	if (bind_data.filter_is_constant) {
+		// Filter was constant-folded at bind time
+		for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+			result_data[row_idx] = ProbeDuckDbBloomFilter(bind_data.sectors, bind_data.bitmask, hashes[row_idx]);
+		}
+		result.SetVectorType(VectorType::FLAT_VECTOR);
+		return;
+	}
+
+	// The filter is not foldable (e.g. an uncorrelated scalar subquery, or a BLOB column), so read it per row.
+	// Depending on the plan, a filter that is the same for every row may still arrive as a flat vector, so the
+	// parsed filter is cached and only re-parsed when the blob changes.
+	auto &filter_vec = args.data[1];
+	UnifiedVectorFormat filter_format;
+	filter_vec.ToUnifiedFormat(count, filter_format);
+	auto filter_data = UnifiedVectorFormat::GetData<string_t>(filter_format);
+	auto &result_validity = FlatVector::ValidityMutable(result);
+
+	unique_ptr<DuckDbBloomFilterProbeBindData> parsed;
 	for (idx_t row_idx = 0; row_idx < count; row_idx++) {
-		auto h = hashes[row_idx];
-		auto sector_idx = h & bitmask;
-		auto mask = GetMask_v1_5(h);
-		result_data[row_idx] = (sectors[sector_idx] & mask) == mask;
+		auto filter_idx = filter_format.sel->get_index(row_idx);
+		if (!filter_format.validity.RowIsValid(filter_idx)) {
+			result_validity.SetInvalid(row_idx);
+			continue;
+		}
+		auto &filter_str = filter_data[filter_idx];
+		auto filter_size = filter_str.GetSize();
+		if (!parsed || parsed->blob_copy.size() != filter_size ||
+		    memcmp(parsed->blob_copy.data(), filter_str.GetData(), filter_size) != 0) {
+			parsed = make_uniq<DuckDbBloomFilterProbeBindData>(bind_data.version, filter_str.GetString(), true);
+		}
+		result_data[row_idx] = ProbeDuckDbBloomFilter(parsed->sectors, parsed->bitmask, hashes[row_idx]);
 	}
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
@@ -691,14 +701,22 @@ void LoadDuckDbBloomFilter(ExtensionLoader &loader) {
 		FunctionDescription desc;
 		desc.description = "Probes a DuckDB-internal bloom filter (serialized as BLOB) for a value. "
 		                   "The version parameter specifies which DuckDB hash algorithm to use. "
-		                   "The filter blob and version are constant-folded at bind time. "
+		                   "The version must be constant; a constant filter blob is parsed once at bind time, "
+		                   "otherwise (e.g. a scalar subquery or a BLOB column) it is read per row. A NULL filter "
+		                   "returns NULL. "
 		                   "Multiple value arguments are combined for multi-key bloom filter probes.";
 		// The values to probe are variadic (ANY); duckdb_functions() lists only the fixed parameters.
 		desc.parameter_names = {"version", "filter_blob"};
 		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::BLOB};
-		desc.examples.push_back("SELECT bitfilters_duckdb_bloom_filter_probe('v2.0', filter_blob, key_col) FROM tbl");
 		desc.examples.push_back(
-		    "SELECT bitfilters_duckdb_bloom_filter_probe('v2.0', filter_blob, col1, col2) FROM tbl");
+		    "SELECT key_col, bitfilters_duckdb_bloom_filter_probe('v2.0', (SELECT bitfilters_duckdb_bloom_filter_create("
+		    "'v2.0', 1024, bitfilters_duckdb_hash('v2.0', k)) FROM range(100) t(k)), key_col) AS maybe_present "
+		    "FROM range(98, 102) t(key_col)");
+		desc.examples.push_back(
+		    "WITH f AS (SELECT bitfilters_duckdb_bloom_filter_create('v2.0', 1024, bitfilters_duckdb_hash('v2.0', i, "
+		    "'k' || i)) AS filter_blob FROM range(100) t(i)) SELECT col1, col2, bitfilters_duckdb_bloom_filter_probe("
+		    "'v2.0', (SELECT filter_blob FROM f), col1, col2) AS maybe_present "
+		    "FROM (VALUES (1::BIGINT, 'k1'), (1, 'k2'), (200, 'k200')) t(col1, col2)");
 		desc.categories = {"bitfilters", "probabilistic"};
 		info.descriptions.push_back(desc);
 		BitfiltersApplyParameterNames(info.functions, info.descriptions);
