@@ -7,22 +7,15 @@
   </a>
 </p>
 
-# `bitfilters` Extension for DuckDB Developed by [Query.Farm](https://query.farm)
+# Bitfilters Extension for DuckDB
 
-[![DuckDB](https://img.shields.io/badge/DuckDB-community_extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://duckdb.org/community_extensions/extensions/bitfilters.html)
-[![v1.5 build](https://github.com/Query-farm/bitfilters/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=v1.5)](https://github.com/Query-farm/bitfilters/actions/workflows/MainDistributionPipeline.yml?query=branch%3Av1.5)
+[![DuckDB](https://img.shields.io/badge/DuckDB-extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://query.farm/products/extensions/bitfilters/)
+[![v2.0 build](https://github.com/Query-farm/bitfilters/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=v2.0)](https://github.com/Query-farm/bitfilters/actions/workflows/MainDistributionPipeline.yml?query=branch%3Av2.0)
 
-A high-performance [DuckDB](https://duckdb.org) extension providing probabilistic data structures for fast set membership testing and approximate duplicate detection. This extension implements state-of-the-art filter algorithms including [Quotient filters](https://en.wikipedia.org/wiki/Quotient_filter), [XOR filters](https://arxiv.org/abs/1912.08258), [Binary Fuse filters](https://arxiv.org/abs/2201.01174), and soon [Bloom filters](https://en.wikipedia.org/wiki/Bloom_filter).
+Build and query probabilistic set-membership filters in DuckDB.
 
 ## Documentation
 
 Full documentation, including installation, usage, the function reference, and cookbook examples, is available at:
 
-**[https://query.farm/products/extensions/bitfilters](https://query.farm/products/extensions/bitfilters)**
-
-## Installation
-
-```sql
-INSTALL bitfilters FROM community;
-LOAD bitfilters;
-```
+**[https://query.farm/products/extensions/bitfilters/](https://query.farm/products/extensions/bitfilters/)**
