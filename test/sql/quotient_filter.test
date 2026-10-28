@@ -296,6 +296,11 @@ true
 statement error
 select quotient_filter(16, 4, f) from (select xor8_filter(hash(i)) as f from range(1000) t(i));
 ----
+is a xor8_filter, not a quotient_filter
+
+statement error
+select quotient_filter(16, 4, f[17:]) from (select xor8_filter(hash(i)) as f from range(1000) t(i));
+----
 quotient filter BLOB
 
 statement ok
@@ -399,23 +404,25 @@ select (select quotient_filter(16, 4, hash(i)) from range(1000) t(i)) =
 ----
 true
 
-# 40 byte header plus the 2^q * (r + 3) bit table, padded to whole 64-bit words
+# 16 byte bitfilters header, 40 byte quotient filter header, and the
+# 2^q * (r + 3) bit table padded to whole 64-bit words
 query I
 select octet_length(quotient_filter(16, 4, hash(i))) from range(1000) t(i);
 ----
-57384
+57400
 
 # q = 4, r = 3: a 96 bit table, padded to 128 bits
 query I
 select octet_length(quotient_filter(4, 3, hash(i))) from range(5) t(i);
 ----
-56
+72
 
-# Filters written before the padding stored the table rounded to bytes. They
-# are still read (by copying the table instead of reading it in place).
+# Filters written before the bitfilters header and the padding are the bare
+# quotient filter, with the table rounded to bytes. They are still read (by
+# copying the table instead of reading it in place).
 statement ok
 create or replace table unpadded as
-  select unhex(left(hex(quotient_filter(4, 3, hash(i))), 2 * 52)) as f from range(5) t(i);
+  select (quotient_filter(4, 3, hash(i)))[17:68] as f from range(5) t(i);
 
 query I
 select octet_length(f) from unpadded;
@@ -467,8 +474,10 @@ select quotient_filter_contains(from_hex('10040700000000000000000000000000000000
 ----
 header inconsistent with q = 16 and r = 4
 
+# These tamper with a headerless filter (as written by older versions), so the
+# byte offsets are those of the quotient filter itself.
 statement ok
-create or replace table one_filter as select quotient_filter(16, 4, hash(i)) as f from range(1000) t(i);
+create or replace table one_filter as select (quotient_filter(16, 4, hash(i)))[17:] as f from range(1000) t(i);
 
 # a real header with the table cut off
 statement error
@@ -516,12 +525,12 @@ corrupt
 statement error
 select quotient_filter_contains(xor8_filter(hash(i)), 1::UBIGINT) from range(1000) t(i);
 ----
-quotient filter BLOB
+is a xor8_filter, not a quotient_filter
 
 statement error
 select quotient_filter_contains(binary_fuse16_filter(hash(i)), 1::UBIGINT) from range(1000) t(i);
 ----
-quotient filter BLOB
+is a binary_fuse16_filter, not a quotient_filter
 
 # a bad BLOB mixed in with good ones still errors instead of crashing
 statement error

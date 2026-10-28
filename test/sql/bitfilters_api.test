@@ -1,0 +1,324 @@
+# name: test/sql/bitfilters_api.test
+# description: filter BLOB headers, values of any type, the generic and inspection functions, and self-sizing quotient filters
+# group: [sql]
+
+require bitfilters
+
+# ---------------------------------------------------------------------------
+# Every filter BLOB starts with a header saying what it is and how its values
+# became keys
+# ---------------------------------------------------------------------------
+
+query IIIII
+select i.filter_type, i.format_version, i.key_hash, i.key_type, octet_length(f) = i.size_bytes
+from (select unnest([quotient_filter(16, 8, v), xor8_filter(v), xor16_filter(v), binary_fuse8_filter(v),
+                     binary_fuse16_filter(v), bloom_filter(1000, 0.01, v)]) as f
+      from (select i::BIGINT as v from range(1000) t(i))),
+     lateral (select bitfilter_info(f) as i)
+order by all;
+----
+binary_fuse16_filter	1	xxhash64	BIGINT	true
+binary_fuse8_filter	1	xxhash64	BIGINT	true
+bloom_filter	1	xxhash64	BIGINT	true
+quotient_filter	1	xxhash64	BIGINT	true
+xor16_filter	1	xxhash64	BIGINT	true
+xor8_filter	1	xxhash64	BIGINT	true
+
+# UBIGINT values are taken as keys as they are
+query II
+select (bitfilter_info(xor8_filter(hash(i)))).key_hash, (bitfilter_info(xor8_filter(hash(i)))).key_type
+from range(100) t(i);
+----
+none	UBIGINT
+
+query I
+select substr(hex(xor8_filter(i)), 1, 8) from range(10) t(i);
+----
+42464C54
+
+# ---------------------------------------------------------------------------
+# Values of any other type are hashed with XXH64 of a fixed encoding -- never
+# with hash(), which may change between DuckDB versions while filters are
+# stored and probed long after they were built. The encoding is the Parquet
+# plain encoding (the same keys Parquet Bloom filters use), else the value's
+# on-disk representation. These pin it: a one-block Bloom filter shows which
+# bit each of the key's eight words got, and was checked against an
+# independent XXH64. If any of these change, stored filters stop working.
+# ---------------------------------------------------------------------------
+
+query II
+select t, hex(f[17:]) from (
+  select 'bigint' as t, bloom_filter(1, 0.5, 42::BIGINT) as f union all
+  select 'integer', bloom_filter(1, 0.5, 42::INTEGER) union all
+  select 'varchar', bloom_filter(1, 0.5, 'hello') union all
+  select 'blob', bloom_filter(1, 0.5, '\xAA\xBB'::BLOB) union all
+  select 'double', bloom_filter(1, 0.5, 1.5::DOUBLE) union all
+  select 'date', bloom_filter(1, 0.5, date '2024-01-02') union all
+  select 'timestamp', bloom_filter(1, 0.5, timestamp '2024-01-02 03:04:05') union all
+  select 'uuid', bloom_filter(1, 0.5, '0b9c0f3a-1e2d-4c5b-8a7f-6e5d4c3b2a19'::UUID) union all
+  select 'decimal', bloom_filter(1, 0.5, 1.5::DECIMAL(18, 3)) union all
+  select 'hugeint', bloom_filter(1, 0.5, 42::HUGEINT) union all
+  select 'boolean', bloom_filter(1, 0.5, true) union all
+  select 'interval', bloom_filter(1, 0.5, interval 3 day)
+) order by t;
+----
+bigint	0001000080000000000000400040000000040000008000000000000810000000
+blob	0080000008000000000080000001000020000000000010000000004000000020
+boolean	8000000000002000000004000000040000002000000000010010000000040000
+date	0000002000000002080000000004000000001000400000000000020000200000
+decimal	0000020000000002000008000800000000100000000000010000010008000000
+double	0000000400000400000040000100000001000000800000000000400000000008
+hugeint	0000008002000000080000000000080000000020800000008000000001000000
+integer	0000001000100000000000081000000020000000001000000000002000000040
+interval	0008000008000000000004000100000000020000400000000000080000010000
+timestamp	0800000004000000000400000000040000000004000000040002000000100000
+uuid	0000008001000000200000008000000040000000000000200100000002000000
+varchar	0000100000020000000400008000000000020000000000800000001000000008
+
+# Types without a stable encoding are refused rather than hashed in a way a
+# later version might not reproduce
+statement error
+select xor8_filter([i, i]) from range(10) t(i);
+----
+cannot build a filter from BIGINT[] values, which have no stable encoding to hash
+
+statement error
+select bloom_filter(10, 0.01, {'a': i}) from range(10) t(i);
+----
+which have no stable encoding to hash
+
+statement error
+select quotient_filter(8, 'x'::ENUM('x', 'y'));
+----
+Cast them to VARCHAR
+
+query I
+select count(*) filter (where quotient_filter_contains(f, 'x'))
+from (select quotient_filter(8, 'x'::ENUM('x', 'y')::VARCHAR) as f);
+----
+1
+
+query IIII
+select count(*) filter (where xor8_filter_contains(x, s)), count(*) filter (where binary_fuse8_filter_contains(b, s)),
+       count(*) filter (where quotient_filter_contains(q, s)), count(*) filter (where bitfilter_contains(x, s))
+from (select 'value-' || i as s from range(3000) t(i)) vals,
+     (select xor8_filter(s) as x, binary_fuse8_filter(s) as b, quotient_filter(14, 8, s) as q
+      from (select 'value-' || i as s from range(3000) t(i)));
+----
+3000	3000	3000	3000
+
+# a filter over hash() output is probed with hash() output
+query I
+select count(*) filter (where xor8_filter_contains(f, hash(i))) from range(1000) t(i),
+  (select xor8_filter(hash(i)) as f from range(1000) t(i));
+----
+1000
+
+# ---------------------------------------------------------------------------
+# Probe values are cast to the type the filter was built from. A value that
+# cannot be cast cannot be in the filter.
+# ---------------------------------------------------------------------------
+
+statement ok
+create table typed as select xor8_filter(i::BIGINT) as big, xor8_filter(i::TINYINT) as tiny,
+  quotient_filter(12, 8, i::BIGINT) as q from range(100) t(i);
+
+query IIIIII
+select xor8_filter_contains(big, 5), xor8_filter_contains(big, 5::TINYINT), xor8_filter_contains(big, 5::UBIGINT),
+       xor8_filter_contains(big, '5'), xor8_filter_contains(big, 'five'), xor8_filter_contains(big, NULL::INTEGER)
+from typed;
+----
+true	true	true	true	false	NULL
+
+query II
+select xor8_filter_contains(tiny, 5), xor8_filter_contains(tiny, 300) from typed;
+----
+true	false
+
+# filters of UBIGINT keys take other integers as keys, as a UBIGINT parameter
+# used to cast them, but not other values
+query II
+select xor8_filter_contains(f, 7), xor8_filter_contains(f, -1) from (select xor8_filter(i::UBIGINT) as f from range(10) t(i));
+----
+true	false
+
+statement error
+select xor8_filter_contains(f, 'seven') from (select xor8_filter(i::UBIGINT) as f from range(10) t(i));
+----
+was built from UBIGINT keys, so it has to be probed with UBIGINT keys too, not VARCHAR values
+
+# ---------------------------------------------------------------------------
+# bitfilter_contains works on any filter with a header
+# ---------------------------------------------------------------------------
+
+query I
+select count(*) filter (where bitfilter_contains(f, i) = (case filter_kind
+         when 'q' then quotient_filter_contains(f, i) when 'x8' then xor8_filter_contains(f, i)
+         when 'x16' then xor16_filter_contains(f, i) when 'b8' then binary_fuse8_filter_contains(f, i)
+         when 'b16' then binary_fuse16_filter_contains(f, i) else bloom_filter_contains(f, i) end))
+from range(2000) t(i),
+     (select unnest(['q', 'x8', 'x16', 'b8', 'b16', 'bloom']) as filter_kind,
+             unnest([quotient_filter(12, 8, i), xor8_filter(i), xor16_filter(i), binary_fuse8_filter(i),
+                     binary_fuse16_filter(i), bloom_filter(1000, 0.01, i)]) as f
+      from range(1000) t(i));
+----
+12000
+
+# per-row filters of different types and key types
+query I
+select count(*) filter (where bitfilter_contains(f, v))
+from (select 7 as v),
+     (select unnest([xor8_filter(i), bloom_filter(100, 0.01, i::VARCHAR), quotient_filter(8, i::SMALLINT)]) as f
+      from range(100) t(i));
+----
+3
+
+statement error
+select bitfilter_contains(f[17:], 1) from (select xor8_filter(i) as f from range(10) t(i));
+----
+has no bitfilters header
+
+statement error
+select bitfilter_contains('BFLT'::BLOB || from_hex('09020100000000000000000000'), 1);
+----
+has format version 9, but this version of bitfilters only reads version 1
+
+statement error
+select bitfilter_contains('BFLT'::BLOB || from_hex('01630100000000000000000000'), 1);
+----
+unknown filter type (99)
+
+# ---------------------------------------------------------------------------
+# Inspection
+# ---------------------------------------------------------------------------
+
+query IIIIII
+select i.entries, i.capacity, i.q, i.r, i.fingerprint_bits, i.seed is null
+from (select quotient_filter_info(quotient_filter(10, 20, i)) as i from range(500) t(i));
+----
+500	1023	10	20	20	true
+
+query IIII
+select i.entries is null, i.fingerprint_bits, i.seed is not null, i.expected_fpr = 2 ^ -8
+from (select xor8_filter_info(xor8_filter(i)) as i from range(500) t(i));
+----
+true	8	true	true
+
+query II
+select i.entries, i.fingerprint_bits from (select binary_fuse16_filter_info(binary_fuse16_filter(i)) as i from range(500) t(i));
+----
+500	16
+
+query II
+select i.load_factor between 0 and 1, i.expected_fpr < 0.01 from (select bloom_filter_info(bloom_filter(1000, 0.01, i)) as i from range(1000) t(i));
+----
+true	true
+
+# the type-specific functions also read filters without a header
+query III
+select i.format_version, i.key_hash, i.key_type from (select xor8_filter_info(xor8_filter(i)[17:]) as i from range(100) t(i));
+----
+0	none	UBIGINT
+
+statement error
+select bitfilter_info(xor8_filter(i)[17:]) from range(100) t(i);
+----
+has no bitfilters header
+
+statement error
+select xor16_filter_info(xor8_filter(i)) from range(100) t(i);
+----
+is a xor8_filter, not a xor16_filter
+
+query I
+select bitfilter_info(null::BLOB);
+----
+NULL
+
+# ---------------------------------------------------------------------------
+# Validity checks answer instead of raising the error a probe would
+# ---------------------------------------------------------------------------
+
+query IIIIIIII
+select xor8_filter_is_valid(x), xor8_filter_is_valid(x[1:100]), xor8_filter_is_valid(x[17:]),
+       xor16_filter_is_valid(x), quotient_filter_is_valid(x), bitfilter_is_valid(x), bitfilter_is_valid(x[17:]),
+       bitfilter_is_valid('not a filter'::BLOB)
+from (select xor8_filter(i) as x from range(1000) t(i));
+----
+true	false	true	false	false	true	false	false
+
+query IIII
+select quotient_filter_is_valid(quotient_filter(8, i)), binary_fuse8_filter_is_valid(binary_fuse8_filter(i)),
+       bloom_filter_is_valid(bloom_filter(10, 0.1, i)), bloom_filter_is_valid(null::BLOB)
+from range(100) t(i);
+----
+true	true	true	NULL
+
+# ---------------------------------------------------------------------------
+# Quotient filters only merge filters whose keys are comparable
+# ---------------------------------------------------------------------------
+
+statement error
+select quotient_filter(12, 8, f)
+from (select quotient_filter(12, 8, i::BIGINT) as f from range(10) t(i)
+      union all select quotient_filter(12, 8, i::VARCHAR) from range(10) t(i));
+----
+cannot merge a filter built from
+
+query I
+select (bitfilter_info(quotient_filter(12, 8, f))).key_type
+from (select quotient_filter(12, 8, i::VARCHAR) as f from range(10) t(i) group by i % 3);
+----
+VARCHAR
+
+# ---------------------------------------------------------------------------
+# quotient_filter(r, value) sizes itself: q is chosen so the distinct values
+# fill at most 3/4 of the 2^q slots
+# ---------------------------------------------------------------------------
+
+statement ok
+create table auto_sized as select quotient_filter(8, i % 1000) as f from range(10000) t(i);
+
+query III
+select (quotient_filter_info(f)).q, (quotient_filter_info(f)).r, (quotient_filter_info(f)).capacity from auto_sized;
+----
+11	8	2047
+
+query I
+select count(*) filter (where not quotient_filter_contains(f, i)) from range(1000) t(i), auto_sized;
+----
+0
+
+query I
+select (quotient_filter_info(quotient_filter(6, i))).q from range(3) t(i);
+----
+2
+
+query I
+select quotient_filter(8, i) from range(10) t(i) where false;
+----
+NULL
+
+statement error
+select quotient_filter(60, i) from range(100) t(i);
+----
+exceeds 64; use a smaller r
+
+statement error
+select quotient_filter(0, i) from range(100) t(i);
+----
+r must be between 1 and 63
+
+# grouped, parallel and spilled like the other filters that collect their values
+statement ok
+set threads = 8;
+
+query I
+select count(*) filter (where not quotient_filter_contains(f, i))
+from range(300000) t(i) join (select i % 10 as g, quotient_filter(10, i) as f from range(300000) t(i) group by g)
+  on i % 10 = g;
+----
+0
+
+statement ok
+reset threads;

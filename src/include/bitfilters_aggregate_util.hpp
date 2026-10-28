@@ -5,10 +5,49 @@
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
 #include "bitfilters_memory.hpp"
+#include "bitfilters_format.hpp"
 #include "duckdb/common/types/list_segment.hpp"
 #include "duckdb/function/aggregate_state_layout.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
+
+// Bind data of an aggregate that builds a filter from values of any type:
+// records how the values become 64-bit keys, which ends up in the filter's
+// header. Bind data of aggregates with more parameters derives from it.
+struct BitfiltersKeyBindData : public FunctionData {
+	explicit BitfiltersKeyBindData(BitfilterKeyFormat keys_p) : keys(keys_p) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<BitfiltersKeyBindData>(keys);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		return keys == other_p.Cast<BitfiltersKeyBindData>().keys;
+	}
+
+	BitfilterKeyFormat keys;
+};
+
+// Binds an aggregate whose last argument holds the values: UBIGINT values are
+// keys already, others are hashed (see BitfilterHash).
+inline unique_ptr<FunctionData> BitfiltersKeyBind(BindAggregateFunctionInput &input) {
+	auto &arguments = input.GetArguments();
+	return make_uniq<BitfiltersKeyBindData>(BitfilterKeyFormat::ForValues(arguments.back()->GetReturnType(), true));
+}
+
+// The keys for a chunk of `input` values: the values themselves if they are
+// keys already, else their hashes, computed into `scratch`.
+inline Vector &BitfiltersUpdateKeys(Vector &input, AggregateInputData &aggr_input_data, Vector &scratch, idx_t count) {
+	auto &keys = aggr_input_data.bind_data->Cast<BitfiltersKeyBindData>().keys;
+	if (keys.hash == BitfilterHash::NONE) {
+		return input;
+	}
+	BitfiltersComputeKeys(keys, input, scratch, count);
+	return scratch;
+}
 
 // State of an aggregate that has to see every key before it can build its
 // filter (the xor and binary fuse filters are constructed in one shot).
@@ -20,7 +59,7 @@ namespace duckdb {
 // STATE_TYPE describes it as a LIST(UBIGINT), which lets the grouped hash
 // aggregate export states to spillable storage when memory runs short.
 struct BitfiltersKeyState {
-	using STATE_TYPE = StateListType<StateTypedValue<uint64_t, StateInputType<0>>>;
+	using STATE_TYPE = StateListType<uint64_t>;
 
 	LinkedList keys;
 };
@@ -68,11 +107,13 @@ struct BitfiltersKeyCollectOperation {
 		append(run_start, end);
 	}
 
+	// The values are the last input; any before them are constant parameters.
 	static void ScatterUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
 	                          Vector &state_vector, idx_t count) {
-		D_ASSERT(input_count == 1);
+		Vector scratch(LogicalType::UBIGINT, count);
+		auto &key_vector = BitfiltersUpdateKeys(inputs[input_count - 1], aggr_input_data, scratch, count);
 		RecursiveUnifiedVectorFormat input;
-		Vector::RecursiveToUnifiedFormat(inputs[0], input);
+		Vector::RecursiveToUnifiedFormat(key_vector, input);
 		const auto functions = KeyFunctions();
 
 		if (state_vector.GetVectorType() == VectorType::CONSTANT_VECTOR) {
@@ -88,10 +129,11 @@ struct BitfiltersKeyCollectOperation {
 	}
 
 	static void ClusterUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
-	                          const ClusteredAggr &clustered, idx_t) {
-		D_ASSERT(input_count == 1);
+	                          const ClusteredAggr &clustered, idx_t count) {
+		Vector scratch(LogicalType::UBIGINT, count);
+		auto &key_vector = BitfiltersUpdateKeys(inputs[input_count - 1], aggr_input_data, scratch, count);
 		RecursiveUnifiedVectorFormat input;
-		Vector::RecursiveToUnifiedFormat(inputs[0], input);
+		Vector::RecursiveToUnifiedFormat(key_vector, input);
 		const auto functions = KeyFunctions();
 
 		for (auto &run : clustered.runs()) {
@@ -173,6 +215,12 @@ struct BitfiltersKeyCollectOperation {
 		}
 	}
 
+	// Sorts `keys` and drops repeats; returns how many distinct keys remain.
+	static idx_t SortUnique(uint64_t *keys, idx_t count) {
+		std::sort(keys, keys + count);
+		return static_cast<idx_t>(std::unique(keys, keys + count) - keys);
+	}
+
 	// Copies the state's keys into one contiguous array, which the filter
 	// constructions need (they also reorder it in place). The array comes from
 	// `allocator` and counts against memory_limit.
@@ -199,12 +247,18 @@ struct BitfiltersKeyCollectOperation {
 };
 
 // Builds the aggregate for a filter whose operation derives from
-// BitfiltersKeyCollectOperation.
+// BitfiltersKeyCollectOperation. The values follow `leading_types` constant
+// parameters; `bind` must produce BitfiltersKeyBindData (or a subclass).
 template <class OP>
-static AggregateFunction BitfiltersKeyAggregate(const LogicalType &input_type, const LogicalType &return_type) {
-	AggregateFunction result({input_type}, return_type, AggregateFunction::StateSize<BitfiltersKeyState>,
+static AggregateFunction BitfiltersKeyAggregate(const vector<LogicalType> &leading_types, const LogicalType &input_type,
+                                                const LogicalType &return_type,
+                                                bind_aggregate_function_t bind = BitfiltersKeyBind) {
+	vector<LogicalType> arguments = leading_types;
+	arguments.push_back(input_type);
+	AggregateFunction result(arguments, return_type, AggregateFunction::StateSize<BitfiltersKeyState>,
 	                         AggregateFunction::StateInitialize<BitfiltersKeyState, OP>, OP::ScatterUpdate, OP::Combine,
 	                         AggregateFunction::StateFinalize<BitfiltersKeyState, string_t, OP>, OP::ClusterUpdate);
+	result.SetBindCallback(bind);
 	AggregateFunction::WireStructStateType<BitfiltersKeyState>(result);
 	return result;
 }
@@ -214,26 +268,35 @@ static AggregateFunction BitfiltersKeyAggregate(const LogicalType &input_type, c
 // callback. These helpers build a unary aggregate whose value argument follows
 // LEADING constant arguments, and whose update skips those leading arguments.
 
-template <idx_t LEADING, class STATE, class INPUT_TYPE, class OP>
+// With KEYED, the bind data is a BitfiltersKeyBindData and the values are
+// turned into keys before they reach the operation.
+template <idx_t LEADING, class STATE, class INPUT_TYPE, class OP, bool KEYED>
 static void BitfiltersSkipLeadingScatterUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
                                                Vector &states, idx_t count) {
 	D_ASSERT(input_count > LEADING);
-	AggregateExecutor::UnaryScatter<STATE, INPUT_TYPE, OP>(inputs[LEADING], states, aggr_input_data, count);
+	if (KEYED) {
+		Vector scratch(LogicalType::UBIGINT, count);
+		auto &keys = BitfiltersUpdateKeys(inputs[LEADING], aggr_input_data, scratch, count);
+		AggregateExecutor::UnaryScatter<STATE, INPUT_TYPE, OP>(keys, states, aggr_input_data, count);
+	} else {
+		AggregateExecutor::UnaryScatter<STATE, INPUT_TYPE, OP>(inputs[LEADING], states, aggr_input_data, count);
+	}
 }
 
 template <idx_t LEADING, class STATE, class INPUT_TYPE, class RESULT_TYPE, class OP,
-          AggregateDestructorType destructor_type = AggregateDestructorType::STANDARD>
+          AggregateDestructorType destructor_type = AggregateDestructorType::STANDARD, bool KEYED = false>
 static AggregateFunction BitfiltersUnaryAggregateWithLeadingArgs(const vector<LogicalType> &leading_types,
                                                                  const LogicalType &input_type,
                                                                  const LogicalType &return_type) {
 	D_ASSERT(leading_types.size() == LEADING);
 	vector<LogicalType> arguments = leading_types;
 	arguments.push_back(input_type);
-	AggregateFunction result(
-	    arguments, return_type, AggregateFunction::StateSize<STATE>,
-	    AggregateFunction::StateInitialize<STATE, OP, destructor_type>,
-	    BitfiltersSkipLeadingScatterUpdate<LEADING, STATE, INPUT_TYPE, OP>, AggregateFunction::StateCombine<STATE, OP>,
-	    AggregateFunction::StateFinalize<STATE, RESULT_TYPE, OP>, FunctionNullHandling::DEFAULT_NULL_HANDLING);
+	AggregateFunction result(arguments, return_type, AggregateFunction::StateSize<STATE>,
+	                         AggregateFunction::StateInitialize<STATE, OP, destructor_type>,
+	                         BitfiltersSkipLeadingScatterUpdate<LEADING, STATE, INPUT_TYPE, OP, KEYED>,
+	                         AggregateFunction::StateCombine<STATE, OP>,
+	                         AggregateFunction::StateFinalize<STATE, RESULT_TYPE, OP>,
+	                         FunctionNullHandling::DEFAULT_NULL_HANDLING);
 	result.SetStateDestructorCallback(AggregateFunction::StateDestroy<STATE, OP>);
 	return result;
 }

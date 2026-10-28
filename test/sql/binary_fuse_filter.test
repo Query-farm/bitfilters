@@ -224,11 +224,11 @@ true	true
 # ---------------------------------------------------------------------------
 
 query III
-select octet_length(f8), octet_length(f16), octet_length(f16) = 2 * octet_length(f8) - 28
+select octet_length(f8), octet_length(f16), octet_length(f16) = 2 * octet_length(f8) - 44
 from (select binary_fuse8_filter(hash(i)) as f8, binary_fuse16_filter(hash(i)) as f16
       from range(1000) t(i));
 ----
-1436	2844	true
+1452	2860	true
 
 # the same input always produces the same filter (construction is deterministic)
 query I
@@ -325,18 +325,18 @@ smaller than the 28 byte header
 statement error
 select binary_fuse8_filter_contains(f8[1:100], 1::UBIGINT) from one_filter;
 ----
-but the BLOB is 100 bytes
+but the BLOB holds 84 bytes
 
 statement error
 select binary_fuse16_filter_contains(f16[1:2000], 1::UBIGINT) from one_filter;
 ----
-but the BLOB is 2000 bytes
+but the BLOB holds 1984 bytes
 
 # a single trailing byte too many
 statement error
 select binary_fuse8_filter_contains(f8 || from_hex('00'), 1::UBIGINT) from one_filter;
 ----
-but the BLOB is 1437 bytes
+but the BLOB holds 1437 bytes
 
 # ---------------------------------------------------------------------------
 # Filters of the wrong width or from a different filter family are rejected.
@@ -347,27 +347,44 @@ but the BLOB is 1437 bytes
 statement error
 select binary_fuse16_filter_contains(f8, 1::UBIGINT) from one_filter;
 ----
+is a binary_fuse8_filter, not a binary_fuse16_filter
+
+# without their headers (as written by older versions) the widths are told
+# apart by their sizes
+statement error
+select binary_fuse16_filter_contains(f8[17:], 1::UBIGINT) from one_filter;
+----
 is not a valid binary_fuse16 filter BLOB
 
 statement error
-select binary_fuse8_filter_contains(f16, 1::UBIGINT) from one_filter;
+select binary_fuse8_filter_contains(f16[17:], 1::UBIGINT) from one_filter;
 ----
 is not a valid binary_fuse8 filter BLOB
 
 statement error
+select binary_fuse8_filter_contains(f16, 1::UBIGINT) from one_filter;
+----
+is a binary_fuse16_filter, not a binary_fuse8_filter
+
+statement error
 select binary_fuse8_filter_contains(xor8_filter(hash(i)), 1::UBIGINT) from range(1000) t(i);
+----
+is a xor8_filter, not a binary_fuse8_filter
+
+statement error
+select binary_fuse8_filter_contains(xor8_filter(hash(i))[17:], 1::UBIGINT) from range(1000) t(i);
 ----
 is not a valid binary_fuse8 filter BLOB
 
 statement error
 select binary_fuse16_filter_contains(xor16_filter(hash(i)), 1::UBIGINT) from range(1000) t(i);
 ----
-is not a valid binary_fuse16 filter BLOB
+is a xor16_filter, not a binary_fuse16_filter
 
 statement error
 select binary_fuse8_filter_contains(quotient_filter(16, 4, hash(i)), 1::UBIGINT) from range(1000) t(i);
 ----
-is not a valid binary_fuse8 filter BLOB
+is a quotient_filter, not a binary_fuse8_filter
 
 # a bad BLOB mixed in with good ones still errors instead of crashing
 statement error
@@ -416,3 +433,12 @@ select count(*) filter (where binary_fuse8_filter_contains(f8, hash(i))) between
 from (select i from range(200000, 300000) t(i)) probes, fp_probe;
 ----
 true	true
+
+# Inputs where most values repeat: the construction used to give up on these
+# ("failed to construct a filter over 5000 values"); it now retries over the
+# distinct values.
+query II
+select count(*) filter (where binary_fuse8_filter_contains(f8, i % 500)), count(*) filter (where binary_fuse16_filter_contains(f16, i % 500))
+from range(5000) t(i), (select binary_fuse8_filter(i % 500) as f8, binary_fuse16_filter(i % 500) as f16 from range(5000) t(i));
+----
+5000	5000

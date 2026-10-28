@@ -187,10 +187,10 @@ true	true
 # ---------------------------------------------------------------------------
 
 query III
-select octet_length(f8), octet_length(f16), octet_length(f16) = 2 * octet_length(f8) - 16
+select octet_length(f8), octet_length(f16), octet_length(f16) = 2 * octet_length(f8) - 32
 from (select xor8_filter(hash(i)) as f8, xor16_filter(hash(i)) as f16 from range(1000) t(i));
 ----
-1276	2536	true
+1292	2552	true
 
 query I
 select (select xor8_filter(hash(i)) from range(1000) t(i)) =
@@ -235,7 +235,7 @@ is not in [1, 4294967295]
 statement error
 select xor8_filter_contains(from_hex('00000000000000000a00000000000000'), 1::UBIGINT);
 ----
-but the BLOB is 16 bytes
+but the BLOB holds 16 bytes
 
 # ---------------------------------------------------------------------------
 # Truncated, padded and otherwise mis-sized real filters
@@ -253,17 +253,17 @@ smaller than the 16 byte header
 statement error
 select xor8_filter_contains(f8[1:100], 1::UBIGINT) from one_filter;
 ----
-but the BLOB is 100 bytes
+but the BLOB holds 84 bytes
 
 statement error
 select xor16_filter_contains(f16[1:2000], 1::UBIGINT) from one_filter;
 ----
-but the BLOB is 2000 bytes
+but the BLOB holds 1984 bytes
 
 statement error
 select xor8_filter_contains(f8 || from_hex('00'), 1::UBIGINT) from one_filter;
 ----
-but the BLOB is 1277 bytes
+but the BLOB holds 1277 bytes
 
 # ---------------------------------------------------------------------------
 # Filters of the wrong width or from a different filter family are rejected
@@ -272,27 +272,44 @@ but the BLOB is 1277 bytes
 statement error
 select xor16_filter_contains(f8, 1::UBIGINT) from one_filter;
 ----
+is a xor8_filter, not a xor16_filter
+
+# without their headers (as written by older versions) the widths are told
+# apart by their sizes
+statement error
+select xor16_filter_contains(f8[17:], 1::UBIGINT) from one_filter;
+----
 is not a valid xor16 filter BLOB
 
 statement error
-select xor8_filter_contains(f16, 1::UBIGINT) from one_filter;
+select xor8_filter_contains(f16[17:], 1::UBIGINT) from one_filter;
 ----
 is not a valid xor8 filter BLOB
 
 statement error
+select xor8_filter_contains(f16, 1::UBIGINT) from one_filter;
+----
+is a xor16_filter, not a xor8_filter
+
+statement error
 select xor8_filter_contains(binary_fuse8_filter(hash(i)), 1::UBIGINT) from range(1000) t(i);
+----
+is a binary_fuse8_filter, not a xor8_filter
+
+statement error
+select xor8_filter_contains(binary_fuse8_filter(hash(i))[17:], 1::UBIGINT) from range(1000) t(i);
 ----
 is not a valid xor8 filter BLOB
 
 statement error
 select xor16_filter_contains(binary_fuse16_filter(hash(i)), 1::UBIGINT) from range(1000) t(i);
 ----
-is not a valid xor16 filter BLOB
+is a binary_fuse16_filter, not a xor16_filter
 
 statement error
 select xor8_filter_contains(quotient_filter(16, 4, hash(i)), 1::UBIGINT) from range(1000) t(i);
 ----
-is not a valid xor8 filter BLOB
+is a quotient_filter, not a xor8_filter
 
 # a bad BLOB mixed in with good ones still errors instead of crashing
 statement error
@@ -316,3 +333,12 @@ select count(*) filter (where xor8_filter_contains(f8, hash(i))) between 100 and
 from (select i from range(200000, 300000) t(i)) probes, fp_probe;
 ----
 true	true
+
+# Inputs where most values repeat: the construction used to give up on these
+# ("failed to construct a filter over 5000 values"); it now retries over the
+# distinct values.
+query II
+select count(*) filter (where xor8_filter_contains(f8, i % 500)), count(*) filter (where xor16_filter_contains(f16, i % 500))
+from range(5000) t(i), (select xor8_filter(i % 500) as f8, xor16_filter(i % 500) as f16 from range(5000) t(i));
+----
+5000	5000

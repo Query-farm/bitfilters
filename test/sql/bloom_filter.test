@@ -1,0 +1,163 @@
+# name: test/sql/bloom_filter.test
+# description: split block Bloom filters: correctness, merging, and compatibility with Parquet Bloom filters
+# group: [sql]
+
+require bitfilters
+
+require parquet
+
+statement ok
+create table gen as
+  select (i % 500)::BIGINT as b, (i % 500)::VARCHAR as s, ((i % 500) - 250)::INTEGER as n from range(5000) t(i);
+
+# ---------------------------------------------------------------------------
+# No false negatives, for values of any type
+# ---------------------------------------------------------------------------
+
+query III
+select count(*) filter (where bloom_filter_contains(fb, b)),
+       count(*) filter (where bloom_filter_contains(fs, s)),
+       count(*) filter (where bloom_filter_contains(fn, n))
+from gen, (select bloom_filter(500, 0.01, b) as fb, bloom_filter(500, 0.01, s) as fs, bloom_filter(500, 0.01, n) as fn
+           from gen);
+----
+5000	5000	5000
+
+query I
+with vals as materialized (select uuid() as v from range(2000) t(i))
+select count(*) filter (where not bloom_filter_contains(f, v)) from vals, (select bloom_filter(2000, 0.01, v) as f from vals);
+----
+0
+
+query I
+select count(*) filter (where not bloom_filter_contains(f, d))
+from (select date '2020-01-01' + i::INTEGER as d from range(3000) t(i)) days,
+     (select bloom_filter(3000, 0.001, d) as f from (select date '2020-01-01' + i::INTEGER as d from range(3000) t(i)));
+----
+0
+
+# the false positive rate is close to the one asked for
+query I
+select count(*) filter (where bloom_filter_contains(f, i)) < 2000
+from range(1000000, 1100000) t(i), (select bloom_filter(10000, 0.01, i) as f from range(10000) t(i));
+----
+true
+
+# probes are cast to the type the filter was built from; values that cannot
+# be cast cannot be in the filter
+query IIIII
+select bloom_filter_contains(f, 7), bloom_filter_contains(f, 7::TINYINT), bloom_filter_contains(f, '7'),
+       bloom_filter_contains(f, 'seven'), bloom_filter_contains(f, NULL::BIGINT)
+from (select bloom_filter(500, 0.01, b) as f from gen);
+----
+true	true	true	false	NULL
+
+# ---------------------------------------------------------------------------
+# The filter is the Parquet split block Bloom filter: for the same values and
+# sizing it is byte-for-byte the one DuckDB's Parquet writer stores.
+# ---------------------------------------------------------------------------
+
+statement ok
+copy gen to '{TEST_DIR}/bloom.parquet' (format parquet);
+
+query II
+with meta as (select path_in_schema as col, bloom_filter_offset as o, bloom_filter_length as l
+              from parquet_metadata('{TEST_DIR}/bloom.parquet')),
+     file as (select content from read_blob('{TEST_DIR}/bloom.parquet')),
+     ours as (select bloom_filter(500, 0.01, b) as fb, bloom_filter(500, 0.01, s) as fs,
+                     bloom_filter(500, 0.01, n) as fn from gen)
+select col,
+       content[o + l - octet_length(f) + 17 : o + l] = f[17:]
+from meta, file, ours, lateral (select case col when 'b' then fb when 's' then fs else fn end as f)
+order by col;
+----
+b	true
+n	true
+s	true
+
+# ---------------------------------------------------------------------------
+# Merging
+# ---------------------------------------------------------------------------
+
+# the union of per-group filters is exactly the filter of all the values
+query I
+select (select bloom_filter_merge(f) from (select bloom_filter(500, 0.01, b) as f from gen group by b % 7))
+     = (select bloom_filter(500, 0.01, b) from gen);
+----
+true
+
+statement error
+select bloom_filter_merge(f)
+from (select bloom_filter(500, 0.01, b) as f from gen union all select bloom_filter(50000, 0.01, b) from gen);
+----
+cannot merge Bloom filters of different sizes
+
+statement error
+select bloom_filter_merge(f)
+from (select bloom_filter(500, 0.01, b) as f from gen union all select bloom_filter(500, 0.01, s) from gen);
+----
+built from VARCHAR values into one built from BIGINT values
+
+statement error
+select bloom_filter_merge(f) from (select xor8_filter(b) as f from gen);
+----
+is a xor8_filter, not a bloom_filter
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+query II
+select bloom_filter(10, 0.01, b), bloom_filter_merge(null::BLOB) from gen where false;
+----
+NULL	NULL
+
+query I
+select count(*) filter (where bloom_filter_contains(f, b)) from gen,
+  (select bloom_filter(10, 0.01, b) as f from (select null::BIGINT as b union all select 3));
+----
+10
+
+# grouped and parallel construction
+statement ok
+set threads = 8;
+
+query I
+select count(*) filter (where not bloom_filter_contains(f, i))
+from range(200000) t(i) join (select i % 16 as g, bloom_filter(20000, 0.01, i) as f from range(200000) t(i) group by g)
+  on i % 16 = g;
+----
+0
+
+statement ok
+reset threads;
+
+statement error
+select bloom_filter(0, 0.01, b) from gen;
+----
+ndv (the expected number of distinct values) must be positive
+
+statement error
+select bloom_filter(100, 1.5, b) from gen;
+----
+fpp (the target false positive rate) must be between 0 and 1
+
+statement error
+select bloom_filter(b, 0.01, b) from gen;
+----
+ndv must be a constant
+
+statement error
+select bloom_filter(1000000000000, 0.000001, b) from gen;
+----
+need more than the maximum filter size
+
+statement error
+select bloom_filter_contains(xor8_filter(b), 1) from gen;
+----
+is a xor8_filter, not a bloom_filter
+
+statement error
+select bloom_filter_contains('BFLT'::BLOB || from_hex('01060108000000000000000000') || 'abc'::BLOB, 1);
+----
+not a positive multiple of 32

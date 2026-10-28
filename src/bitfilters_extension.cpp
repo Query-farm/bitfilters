@@ -5,7 +5,8 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
-// #include "bitfilters_bloom_filter.hpp"
+#include "bitfilters_bloom_filter.hpp"
+#include "bitfilters_inspect.hpp"
 #include "bitfilters_duckdb_bloom_filter.hpp"
 #include "bitfilters_quotient_filter.hpp"
 #include "bitfilters_xor_filter.hpp"
@@ -14,11 +15,11 @@
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register Bloom filter functions
-	//	LoadBloomFilter(instance);
 	LoadQuotientFilter(loader);
 	LoadXorFilter(loader);
 	LoadBinaryFuseFilter(loader);
+	LoadBloomFilter(loader);
+	LoadBitfiltersInspect(loader);
 	LoadDuckDbBloomFilter(loader);
 
 	QueryFarmSendTelemetry(loader, "bitfilters", BitfiltersExtension().Version());
@@ -32,7 +33,7 @@ std::string BitfiltersExtension::Name() {
 }
 
 std::string BitfiltersExtension::Version() const {
-	return "2026102101";
+	return "2026102801";
 }
 
 } // namespace duckdb

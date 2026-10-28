@@ -10,14 +10,14 @@ require bitfilters
 # the signature, which defaults to col0, col1, ...). Functions are matched by
 # name since extension_name is NULL when the extension is linked statically.
 query I
-SELECT count(*) FROM duckdb_functions() WHERE regexp_matches(function_name, '^((binary_fuse|xor)(8|16)|quotient)_filter(_contains)?$|^bitfilters_')
+SELECT count(*) FROM duckdb_functions() WHERE regexp_matches(function_name, '^(((binary_fuse|xor)(8|16)|quotient|bloom)_filter(_contains|_info|_is_valid|_merge)?|bitfilter_(contains|info|is_valid))$|^bitfilters_')
 ----
-14
+33
 
 query IIII
 SELECT function_name, function_type, parameters, parameter_types
 FROM duckdb_functions()
-WHERE regexp_matches(function_name, '^((binary_fuse|xor)(8|16)|quotient)_filter(_contains)?$|^bitfilters_')
+WHERE regexp_matches(function_name, '^(((binary_fuse|xor)(8|16)|quotient|bloom)_filter(_contains|_info|_is_valid|_merge)?|bitfilter_(contains|info|is_valid))$|^bitfilters_')
   AND (description IS NULL OR description = ''
        OR examples IS NULL OR len(examples) = 0
        OR categories IS NULL OR len(categories) = 0
@@ -34,5 +34,6 @@ FROM duckdb_functions()
 WHERE function_name = 'quotient_filter'
 ORDER BY parameter_types::VARCHAR
 ----
+[r, value]	[INTEGER, ANY]	[bitfilters, probabilistic]
+[q, r, value]	[INTEGER, INTEGER, ANY]	[bitfilters, probabilistic]
 [q, r, filter]	[INTEGER, INTEGER, BLOB]	[bitfilters, probabilistic]
-[q, r, value]	[INTEGER, INTEGER, UBIGINT]	[bitfilters, probabilistic]

@@ -12,102 +12,113 @@
 #include "bitfilters_aggregate_util.hpp"
 #include "vendor/quotient-filter/quotient_filter.hpp"
 
+#include <cmath>
+
 namespace duckdb {
 
 namespace {
 
-struct QuotientFilterBindData : public FunctionData {
-	QuotientFilterBindData() {
+// Whether a filter with these parameters fits in a BLOB (at most 4GB). Any
+// q >= 35 is over the limit (2^35 slots of at least 4 bits each); checking it
+// first keeps the size computation from overflowing.
+bool QuotientFilterFits(uint32_t q, uint32_t r) {
+	return q < 35 &&
+	       BITFILTERS_HEADER_SIZE + QuotientFilter::serialized_size(q, r) <= NumericLimits<uint32_t>::Maximum();
+}
+
+// The value of a constant INTEGER parameter, between 1 and 63.
+uint32_t BindQuotientParameter(ClientContext &context, Expression &argument, const char *name) {
+	if (argument.HasParameter()) {
+		throw ParameterNotResolvedException();
 	}
-	explicit QuotientFilterBindData(uint32_t q, uint32_t r) : q(q), r(r) {
-		// Validate parameters during construction
-		if (q == 0) {
-			throw InvalidInputException("Quotient filter q must be > 0");
-		}
-		if (r == 0) {
-			throw InvalidInputException("Quotient filter r must be > 0");
-		}
-		if (q + r > 64) {
-			throw InvalidInputException("Quotient filter q + r must be <= 64");
-		}
+	if (!argument.IsFoldable()) {
+		throw BinderException("Quotient filter %s value can only be a constant", name);
+	}
+	Value value = ExpressionExecutor::EvaluateScalar(context, argument);
+	if (value.IsNull()) {
+		throw BinderException("Quotient filter %s cannot be NULL", name);
+	}
+	// The signature declares the parameters as INTEGER, so the binder has
+	// already cast them; only the range is left to check.
+	const auto result = value.GetValue<int32_t>();
+	if (result <= 0 || result >= 64) {
+		throw BinderException("Quotient filter %s must be between 1 and 63, got %d", name, result);
+	}
+	return static_cast<uint32_t>(result);
+}
+
+struct QuotientFilterBindData : public BitfiltersKeyBindData {
+	//! q = 0 for the self-sizing aggregate, which picks q when it finalizes
+	QuotientFilterBindData(BitfilterKeyFormat keys_p, uint32_t q_p, uint32_t r_p)
+	    : BitfiltersKeyBindData(keys_p), q(q_p), r(r_p) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<QuotientFilterBindData>(q, r);
+		return make_uniq<QuotientFilterBindData>(keys, q, r);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<QuotientFilterBindData>();
-		return q == other.q && r == other.r;
+		return keys == other.keys && q == other.q && r == other.r;
 	}
 
 	uint32_t q;
-
 	uint32_t r;
 };
 
+// quotient_filter(q, r, value) and quotient_filter(q, r, filter). The q and r
+// arguments stay in the argument list (DuckDB 2.0 no longer allows erasing
+// arguments); the update callback skips them.
 unique_ptr<FunctionData> QuotientFilterBind(BindAggregateFunctionInput &input) {
 	auto &context = input.GetClientContext();
 	auto &arguments = input.GetArguments();
-	if (arguments.size() > 3) {
-		throw BinderException("Quotient filter aggregate function requires exactly 3 arguments");
+	D_ASSERT(arguments.size() == 3);
+	const auto q = BindQuotientParameter(context, *arguments[0], "q");
+	const auto r = BindQuotientParameter(context, *arguments[1], "r");
+	if (q + r > 64) {
+		throw BinderException("Quotient filter q + r must be at most 64, got q = %u and r = %u", q, r);
 	}
-	if (arguments[0]->HasParameter()) {
-		throw ParameterNotResolvedException();
-	}
-	if (!arguments[0]->IsFoldable()) {
-		throw BinderException("Quotient filter q value can only be a constant");
-	}
-	Value q = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
-	if (q.IsNull()) {
-		throw BinderException("Quotient filter q cannot be NULL");
-	}
-	// The signature declares q and r as INTEGER, so the binder has already
-	// cast them; only the range is left to check.
-	const auto q_value = q.GetValue<int32_t>();
-	if (q_value <= 0 || q_value >= 64) {
-		throw BinderException("Quotient filter q must be between 1 and 63, got %d", q_value);
-	}
-	const auto actual_q = static_cast<uint32_t>(q_value);
-
-	if (arguments[1]->HasParameter()) {
-		throw ParameterNotResolvedException();
-	}
-	if (!arguments[1]->IsFoldable()) {
-		throw BinderException("Quotient filter r value can only be a constant");
-	}
-	Value r = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
-	if (r.IsNull()) {
-		throw BinderException("Quotient filter r cannot be NULL");
-	}
-	const auto r_value = r.GetValue<int32_t>();
-	if (r_value <= 0 || r_value >= 64) {
-		throw BinderException("Quotient filter r must be between 1 and 63, got %d", r_value);
-	}
-	const auto actual_r = static_cast<uint32_t>(r_value);
-	if (actual_r + actual_q > 64) {
-		throw BinderException("Quotient filter q + r must be at most 64, got q = %u and r = %u", actual_q, actual_r);
-	}
-
-	// A filter this big can never be returned: DuckDB BLOBs top out at 4GB. Fail
-	// here rather than letting the aggregate allocate a table of that size.
-	// Any q >= 35 is over the limit (2^35 slots of at least 4 bits each), and
-	// rejecting it first keeps the size computation from overflowing.
-	if (actual_q >= 35 || QuotientFilter::serialized_size(actual_q, actual_r) > NumericLimits<uint32_t>::Maximum()) {
+	// A filter this big can never be returned. Fail here rather than letting
+	// the aggregate allocate a table of that size.
+	if (!QuotientFilterFits(q, r)) {
 		throw BinderException(
-		    "Quotient filter with q = %u and r = %u would need %s, which exceeds the maximum BLOB "
-		    "size of %u bytes; use a smaller q",
-		    actual_q, actual_r,
-		    actual_q >= 35 ? string("more than 16GB")
-		                   : StringUtil::Format("%llu bytes", static_cast<uint64_t>(
-		                                                          QuotientFilter::serialized_size(actual_q, actual_r))),
+		    "Quotient filter with q = %u and r = %u would need %s, which exceeds the maximum BLOB size of %u bytes; "
+		    "use a smaller q",
+		    q, r,
+		    q >= 35 ? string("more than 16GB")
+		            : StringUtil::Format("%llu bytes", static_cast<uint64_t>(QuotientFilter::serialized_size(q, r))),
 		    NumericLimits<uint32_t>::Maximum());
 	}
+	auto keys = BitfilterKeyFormat::ForValues(arguments.back()->GetReturnType(), true);
+	return make_uniq<QuotientFilterBindData>(keys, q, r);
+}
 
-	// The q and r arguments stay in the argument list (DuckDB 2.0 no longer allows
-	// erasing arguments); the update callback skips them.
+// quotient_filter(r, value): q is chosen from the input.
+unique_ptr<FunctionData> QuotientFilterAutoBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
+	D_ASSERT(arguments.size() == 2);
+	const auto r = BindQuotientParameter(context, *arguments[0], "r");
+	auto keys = BitfilterKeyFormat::ForValues(arguments.back()->GetReturnType(), true);
+	return make_uniq<QuotientFilterBindData>(keys, 0, r);
+}
 
-	return make_uniq<QuotientFilterBindData>(actual_q, actual_r);
+// Writes `filter` with a header to `target` in `result`.
+void WriteQuotientFilter(const QuotientFilter &filter, const BitfilterKeyFormat &keys, Vector &result,
+                         string_t &target) {
+	target = StringVector::EmptyString(result, BITFILTERS_HEADER_SIZE + filter.serialized_size());
+	auto out = target.GetDataWriteable();
+	BitfiltersWriteHeader(data_ptr_cast(out), BitfilterType::QUOTIENT, keys);
+	filter.serialize_into(out + BITFILTERS_HEADER_SIZE);
+	target.Finalize();
+}
+
+void CheckSameKeys(const BitfilterKeyFormat &target, const BitfilterKeyFormat &source) {
+	if (target != source) {
+		throw InvalidInputException("quotient_filter: cannot merge a filter built from %s values (hash: %s) into one "
+		                            "built from %s values (hash: %s); their keys are not comparable",
+		                            source.KeyTypeName(), source.HashName(), target.KeyTypeName(), target.HashName());
+	}
 }
 
 struct QuotientFilterState {
@@ -119,12 +130,15 @@ struct QuotientFilterState {
 	// (see bitfilters_memory.hpp), so it counts against memory_limit; the
 	// table remembers that allocator and frees itself through it.
 	QuotientFilter *filter;
+	//! How the filter's values became keys (set with the filter)
+	BitfilterKeyFormat keys;
 };
 
 struct QuotientFilterOperationBase {
 	template <class STATE>
 	static void Initialize(STATE &state) {
 		state.filter = nullptr;
+		state.keys = BitfilterKeyFormat();
 	}
 
 	static bool IgnoreNull() {
@@ -139,10 +153,13 @@ struct QuotientFilterOperationBase {
 
 	// Every state of one aggregate is created with the bound q and r.
 	template <class STATE>
-	static QuotientFilter &GetOrCreateFilter(STATE &state, AggregateInputData &input) {
+	static QuotientFilter &GetOrCreateFilter(STATE &state, AggregateInputData &input, const BitfilterKeyFormat &keys) {
 		if (!state.filter) {
 			auto &bind_data = input.bind_data->Cast<QuotientFilterBindData>();
 			state.filter = new QuotientFilter(bind_data.q, bind_data.r, BitfiltersStateAllocator(input));
+			state.keys = keys;
+		} else {
+			CheckSameKeys(state.keys, keys);
 		}
 		return *state.filter;
 	}
@@ -162,11 +179,13 @@ struct QuotientFilterOperationBase {
 			} else {
 				target.filter = new QuotientFilter(*source.filter, BitfiltersStateAllocator(input));
 			}
+			target.keys = source.keys;
 			return;
 		}
 		// Both states have the bound q and r, so this only fails if the union
 		// does not fit -- and then building the filter on one thread would
 		// have failed too.
+		CheckSameKeys(target.keys, source.keys);
 		target.filter->merge_from(*source.filter);
 	}
 
@@ -176,20 +195,19 @@ struct QuotientFilterOperationBase {
 			finalize_data.ReturnNull();
 			return;
 		}
-		target = StringVector::EmptyString(finalize_data.result, state.filter->serialized_size());
-		state.filter->serialize_into(target.GetDataWriteable());
-		target.Finalize();
+		WriteQuotientFilter(*state.filter, state.keys, finalize_data.result, target);
 	}
 };
 
 struct QuotientFilterMergeOperation : QuotientFilterOperationBase {
 	template <class A_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const A_TYPE &a_data, AggregateUnaryInput &unary_input) {
-		auto &filter = GetOrCreateFilter(state, unary_input.input);
-		// The constructor validates the BLOB and throws if it is not one of
+		auto blob = BitfilterBlob::Expect(a_data, BitfilterType::QUOTIENT, "quotient_filter");
+		// The constructor validates the payload and throws if it is not one of
 		// ours. It reads the table in place, so this allocates nothing.
-		QuotientFilter incoming(a_data.GetData(), a_data.GetSize(), BitfiltersStateAllocator(unary_input.input));
-		filter.merge_from(incoming);
+		QuotientFilter incoming(const_char_ptr_cast(blob.payload), blob.payload_size,
+		                        BitfiltersStateAllocator(unary_input.input));
+		GetOrCreateFilter(state, unary_input.input, blob.keys).merge_from(incoming);
 	}
 
 	// Merging the same filter again adds nothing.
@@ -202,7 +220,8 @@ struct QuotientFilterMergeOperation : QuotientFilterOperationBase {
 struct QuotientFilterCreateOperation : QuotientFilterOperationBase {
 	template <class A_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const A_TYPE &a_data, AggregateUnaryInput &unary_input) {
-		auto &filter = GetOrCreateFilter(state, unary_input.input);
+		auto &keys = unary_input.input.bind_data->Cast<QuotientFilterBindData>().keys;
+		auto &filter = GetOrCreateFilter(state, unary_input.input, keys);
 		if (!filter.insert(a_data)) {
 			throw InvalidInputException("quotient_filter: the filter is full (q = %u holds at most %llu values); "
 			                            "increase q to hold more values",
@@ -217,116 +236,137 @@ struct QuotientFilterCreateOperation : QuotientFilterOperationBase {
 	}
 };
 
-template <typename T>
-auto static QuotientFilterMergeAggregate(const LogicalType &type, const LogicalType &result_type) -> AggregateFunction
-
-{
-	return BitfiltersUnaryAggregateWithLeadingArgs<2, QuotientFilterState, string_t, string_t,
-	                                               QuotientFilterMergeOperation, AggregateDestructorType::LEGACY>(
-	    {LogicalType::INTEGER, LogicalType::INTEGER}, result_type, result_type);
-}
-
-template <typename T>
-auto static QuotientFilterCreateAggregate(const LogicalType &type, const LogicalType &result_type)
-    -> AggregateFunction {
-	return BitfiltersUnaryAggregateWithLeadingArgs<2, QuotientFilterState, T, string_t, QuotientFilterCreateOperation,
-	                                               AggregateDestructorType::LEGACY>(
-	    {LogicalType::INTEGER, LogicalType::INTEGER}, type, result_type);
-}
-
-template <class T>
-static inline void QuotientFilterContains(DataChunk &args, ExpressionState &state, Vector &result) {
-	// Get the references to the incoming vectors.
-	D_ASSERT(args.ColumnCount() == 2);
-
-	auto &filter_vector = args.data[0];
-	auto &item_vector = args.data[1];
-
-	// Filters read their table straight out of the BLOB; only filters written
-	// before the table was padded to whole words are copied, and those copies
-	// count against memory_limit.
-	auto &allocator = BufferAllocator::Get(state.GetContext());
-
-	if (filter_vector.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-		if (ConstantVector::IsNull(filter_vector)) {
-			result.SetVectorType(VectorType::CONSTANT_VECTOR);
-			ConstantVector::SetNull(result, true);
+// quotient_filter(r, value): collects the keys (spillably, like the xor and
+// binary fuse filters) and builds a filter just large enough for them, so
+// nobody has to guess q. The distinct keys fill at most 3/4 of the slots,
+// past which quotient filter clusters grow long and lookups slow down.
+struct QuotientFilterAutoOperation : BitfiltersKeyCollectOperation {
+	template <class T, class STATE>
+	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+		if (state.keys.total_capacity == 0) {
+			finalize_data.ReturnNull();
 			return;
 		}
-		auto &blob = ConstantVector::GetData<string_t>(filter_vector)[0];
-		// The constructor validates the BLOB and throws if it is not one of ours.
-		QuotientFilter filter(blob.GetData(), blob.GetSize(), allocator);
-		UnaryExecutor::Execute<T, bool>(item_vector, result,
-		                                [&](T item_data) { return filter.may_contain(item_data); });
-		return;
-	}
+		auto &bind_data = finalize_data.input.bind_data->Cast<QuotientFilterBindData>();
+		auto &allocator = BitfiltersStateAllocator(finalize_data.input);
 
-	// Per-row filters. The same filter is usually repeated across many rows (a
-	// join against a table of filters), so remember the last blob we validated.
-	// Only blobs that passed validation are cached, and those are always longer
-	// than the 12 byte inline threshold, so their data pointers are stable heap
-	// addresses rather than pointers into a by-value string_t on the stack.
-	unique_ptr<QuotientFilter> cached_filter;
-	const char *cached_data = nullptr;
-	uint32_t cached_size = 0;
-	BinaryExecutor::Execute<string_t, T, bool>(
-	    filter_vector, item_vector, result, [&](string_t filter_data, T item_data) {
-		    if (!cached_filter || filter_data.GetData() != cached_data || filter_data.GetSize() != cached_size) {
-			    cached_filter = make_uniq<QuotientFilter>(filter_data.GetData(), filter_data.GetSize(), allocator);
-			    cached_data = filter_data.GetData();
-			    cached_size = filter_data.GetSize();
-		    }
-		    return cached_filter->may_contain(item_data);
-	    });
+		auto key_array = GatherKeys(state.keys, allocator);
+		auto keys = reinterpret_cast<uint64_t *>(key_array.get());
+		const auto distinct = SortUnique(keys, state.keys.total_capacity);
+		const auto end = keys + distinct;
+
+		uint32_t q = 1;
+		while ((1ULL << q) / 4 * 3 < distinct) {
+			q++;
+		}
+		const auto r = bind_data.r;
+		if (q + r > 64) {
+			throw InvalidInputException("quotient_filter: %llu distinct values need q = %u, and q + r = %u exceeds 64; "
+			                            "use a smaller r",
+			                            distinct, q, q + r);
+		}
+		if (!QuotientFilterFits(q, r)) {
+			throw OutOfRangeException("quotient_filter: %llu distinct values need q = %u, and the filter would exceed "
+			                          "the maximum BLOB size of %u bytes",
+			                          distinct, q, NumericLimits<uint32_t>::Maximum());
+		}
+
+		QuotientFilter filter(q, r, allocator);
+		for (auto key = keys; key != end; key++) {
+			// Never fails: the filter has room for every distinct key, and
+			// keys that share a fingerprint are only stored once.
+			filter.insert(*key);
+		}
+		WriteQuotientFilter(filter, bind_data.keys, finalize_data.result, target);
+	}
+};
+
+AggregateFunction QuotientFilterMergeAggregate() {
+	return BitfiltersUnaryAggregateWithLeadingArgs<2, QuotientFilterState, string_t, string_t,
+	                                               QuotientFilterMergeOperation, AggregateDestructorType::LEGACY>(
+	    {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::BLOB, LogicalType::BLOB);
 }
 
-// Helper function to register Quotient filter functions for a specific type
-template <typename T>
-static void RegisterQuotientFilterFunctionsForType(AggregateFunctionSet &Quotientfilter, const LogicalType &type) {
-	// Register create aggregate function
-	{
-		auto fun = QuotientFilterCreateAggregate<T>(type, LogicalType::BLOB);
-		fun.SetBindCallback(QuotientFilterBind);
-		fun.SetFallible();
-		Quotientfilter.AddFunction(fun);
-	}
-
-	// Register merge aggregate function
-	{
-		auto fun = QuotientFilterMergeAggregate<T>(type, LogicalType::BLOB);
-		fun.SetBindCallback(QuotientFilterBind);
-		fun.SetFallible();
-		Quotientfilter.AddFunction(fun);
-	}
+AggregateFunction QuotientFilterCreateAggregate() {
+	return BitfiltersUnaryAggregateWithLeadingArgs<2, QuotientFilterState, uint64_t, string_t,
+	                                               QuotientFilterCreateOperation, AggregateDestructorType::LEGACY,
+	                                               true>({LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::ANY,
+	                                                     LogicalType::BLOB);
 }
 
-// Helper function to register scalar contains functions for a specific type
-template <typename T>
-static void RegisterQuotientFilterContainsForType(ScalarFunctionSet &fs, const LogicalType &type) {
-	fs.AddFunction(ScalarFunction({LogicalType::BLOB, type}, LogicalType::BOOLEAN, QuotientFilterContains<T>));
+class QuotientFilterProbe : public BitfilterProbeBase<QuotientFilterProbe> {
+public:
+	QuotientFilterProbe(const_data_ptr_t payload, idx_t size, Allocator &allocator)
+	    : filter(const_char_ptr_cast(payload), size, allocator) {
+	}
+
+	bool ContainsKey(uint64_t key) const {
+		return filter.may_contain(key);
+	}
+
+	void Describe(BitfilterInfo &info) const override {
+		const auto slots = static_cast<double>(1ULL << filter.q());
+		info.entries = filter.entries();
+		info.capacity = filter.capacity();
+		info.load_factor = static_cast<double>(filter.entries()) / slots;
+		info.fingerprint_bits = static_cast<uint8_t>(filter.r());
+		// A lookup can only match a stored remainder in its own run.
+		info.expected_fpr = 1.0 - std::exp(-info.load_factor * std::ldexp(1.0, -static_cast<int>(filter.r())));
+		info.q = static_cast<uint8_t>(filter.q());
+		info.r = static_cast<uint8_t>(filter.r());
+	}
+
+private:
+	QuotientFilter filter;
+};
+
+void QuotientFilterContains(DataChunk &args, ExpressionState &state, Vector &result) {
+	static const BitfilterType type = BitfilterType::QUOTIENT;
+	BitfiltersContains(args, state, result, &type, "quotient_filter_contains");
 }
+
 } // namespace
 
+unique_ptr<BitfilterProbe> QuotientFilterOpen(const_data_ptr_t payload, idx_t size, Allocator &allocator,
+                                              const char *) {
+	return make_uniq<QuotientFilterProbe>(payload, size, allocator);
+}
+
 void LoadQuotientFilter(ExtensionLoader &loader) {
-	// Register aggregate functions
 	{
-		AggregateFunctionSet Quotientfilter("quotient_filter");
+		AggregateFunctionSet quotient_filter("quotient_filter");
+		{
+			auto fun = QuotientFilterCreateAggregate();
+			fun.SetBindCallback(QuotientFilterBind);
+			fun.SetFallible();
+			quotient_filter.AddFunction(fun);
+		}
+		{
+			auto fun = QuotientFilterMergeAggregate();
+			fun.SetBindCallback(QuotientFilterBind);
+			fun.SetFallible();
+			quotient_filter.AddFunction(fun);
+		}
+		{
+			auto fun = BitfiltersKeyAggregate<QuotientFilterAutoOperation>({LogicalType::INTEGER}, LogicalType::ANY,
+			                                                               LogicalType::BLOB, QuotientFilterAutoBind);
+			fun.SetFallible();
+			quotient_filter.AddFunction(fun);
+		}
 
-		RegisterQuotientFilterFunctionsForType<uint64_t>(Quotientfilter, LogicalType::UBIGINT);
-
-		CreateAggregateFunctionInfo Quotientfilter_create_info(Quotientfilter);
-
+		CreateAggregateFunctionInfo info(quotient_filter);
 		{
 			FunctionDescription desc;
-			desc.description = "Creates a Quotient filter by aggregating UBIGINT values. "
-			                   "q is the number of quotient bits (controls capacity, ~2^q slots) and r is the number "
-			                   "of remainder bits (controls false positive rate, ~2^-r). q + r must be <= 64. "
-			                   "Returns a BLOB to probe with quotient_filter_contains.";
+			desc.description = "Creates a Quotient filter from values of any type: UBIGINT values are used as keys as "
+			                   "they are, other values are hashed with XXH64 of a fixed encoding that does not change "
+			                   "between DuckDB versions. q is the number of quotient bits (the filter holds at most "
+			                   "2^q - 1 values) and r the number of remainder bits (false positive rate ~2^-r). q + r "
+			                   "must be <= 64. Returns a BLOB to probe with quotient_filter_contains.";
 			desc.parameter_names = {"q", "r", "value"};
-			desc.parameter_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::UBIGINT};
-			desc.examples.push_back("SELECT quotient_filter(16, 8, hash(column)) FROM table");
+			desc.parameter_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::ANY};
+			desc.examples.push_back("SELECT quotient_filter(16, 8, column) FROM table");
 			desc.categories = {"bitfilters", "probabilistic"};
-			Quotientfilter_create_info.descriptions.push_back(desc);
+			info.descriptions.push_back(desc);
 		}
 		{
 			// The merge overload takes filter BLOBs instead of values; duckdb_functions()
@@ -336,39 +376,45 @@ void LoadQuotientFilter(ExtensionLoader &loader) {
 			                   "containing every value of the inputs. q and r size the merged filter, which holds at "
 			                   "most 2^q - 1 values. Each input must keep at least q + r bits of each hash (its own "
 			                   "q + r must be >= q + r), so a merge can grow q only by giving up as many remainder "
-			                   "bits. q + r must be <= 64.";
+			                   "bits. The inputs must be built from the same type of values. q + r must be <= 64.";
 			desc.parameter_names = {"q", "r", "filter"};
 			desc.parameter_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BLOB};
 			desc.examples.push_back("SELECT quotient_filter(16, 8, filter) FROM filters");
 			desc.categories = {"bitfilters", "probabilistic"};
-			Quotientfilter_create_info.descriptions.push_back(desc);
+			info.descriptions.push_back(desc);
 		}
-
-		BitfiltersApplyParameterNames(Quotientfilter_create_info.functions, Quotientfilter_create_info.descriptions);
-		loader.RegisterFunction(Quotientfilter_create_info);
+		{
+			FunctionDescription desc;
+			desc.description = "Creates a Quotient filter sized to fit its input: q is chosen so that the distinct "
+			                   "values fill at most 3/4 of the 2^q slots. r is the number of remainder bits (false "
+			                   "positive rate ~2^-r). Values are handled as by quotient_filter(q, r, value).";
+			desc.parameter_names = {"r", "value"};
+			desc.parameter_types = {LogicalType::INTEGER, LogicalType::ANY};
+			desc.examples.push_back("SELECT quotient_filter(8, column) FROM table");
+			desc.categories = {"bitfilters", "probabilistic"};
+			info.descriptions.push_back(desc);
+		}
+		BitfiltersApplyParameterNames(info.functions, info.descriptions);
+		loader.RegisterFunction(info);
 	}
 
-	// Register scalar functions
 	{
 		ScalarFunctionSet fs("quotient_filter_contains");
-
-		RegisterQuotientFilterContainsForType<uint64_t>(fs, LogicalType::UBIGINT);
-
+		fs.AddFunction(
+		    ScalarFunction({LogicalType::BLOB, LogicalType::ANY}, LogicalType::BOOLEAN, QuotientFilterContains));
 		fs.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fs));
-
 		{
 			FunctionDescription desc;
 			desc.description = "Tests if a Quotient filter may contain a value. Returns true if the value "
 			                   "might be in the set (with possible false positives), or false if the value "
 			                   "is definitely not in the set (no false negatives).";
 			desc.parameter_names = {"filter", "value"};
-			desc.parameter_types = {LogicalType::BLOB, LogicalType::UBIGINT};
+			desc.parameter_types = {LogicalType::BLOB, LogicalType::ANY};
 			desc.examples.push_back("SELECT quotient_filter_contains(filter, 42) FROM table");
 			desc.categories = {"bitfilters", "probabilistic"};
 			info.descriptions.push_back(desc);
 		}
-
 		BitfiltersApplyParameterNames(info.functions, info.descriptions);
 		loader.RegisterFunction(info);
 	}
