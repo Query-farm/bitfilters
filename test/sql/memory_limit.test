@@ -96,6 +96,12 @@ select count(*) from duckdb_memory() where tag = 'ALLOCATOR' and memory_usage_by
 # and describe them to DuckDB, so when the groups outgrow memory_limit the hash
 # aggregate spills them to disk instead of failing. (Quotient filter states
 # are fixed-size tables; they count against memory_limit but are not spilled.)
+#
+# The spill directory is set explicitly: the test runner's default one is not
+# a valid path on Windows.
+statement ok
+set temp_directory = '{TEST_DIR}/spill';
+
 statement ok
 set memory_limit = '64MB';
 
