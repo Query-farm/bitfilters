@@ -11,6 +11,8 @@
 #include <vector>
 #include <string>
 
+#include "duckdb/common/allocator.hpp"
+
 struct QuotientFilterValues {
 	explicit QuotientFilterValues() : QuotientFilterValues(1, 2) {
 	}
@@ -32,16 +34,37 @@ struct QuotientFilterValues {
 
 class QuotientFilter {
 public:
-	QuotientFilter(const QuotientFilter &other);
-	QuotientFilter(uint32_t q, uint32_t r);
-	QuotientFilter(const std::string &data);
-	QuotientFilter(const char *data, size_t length);
+	/*
+	 * An empty filter with 2^q slots and r remainder bits per slot. The table
+	 * is allocated from `allocator`, which in an aggregate is DuckDB's buffer
+	 * managed allocator, so it counts against memory_limit.
+	 */
+	QuotientFilter(uint32_t q, uint32_t r, duckdb::Allocator &allocator);
+
+	/*
+	 * A filter read from a serialize()d BLOB. The BLOB is validated first.
+	 *
+	 * The table is not copied when the BLOB holds it as whole 64-bit words
+	 * (every BLOB serialize() produces does): the filter then reads straight
+	 * out of `data`, which must outlive it, and is read-only. Older BLOBs whose
+	 * table ends mid-word are copied into a table from `allocator`.
+	 */
+	QuotientFilter(const char *data, size_t length, duckdb::Allocator &allocator);
+
+	/* A writable deep copy of `other`. */
+	QuotientFilter(const QuotientFilter &other, duckdb::Allocator &allocator);
+
+	QuotientFilter(const QuotientFilter &) = delete;
+	QuotientFilter &operator=(const QuotientFilter &) = delete;
 
 	/*
 	 * Inserts a hash into the QF.
 	 * Only the lowest q+r bits are actually inserted into the QF table.
 	 *
-	 * Returns false if the QF is full.
+	 * Returns false if the QF is full and does not already contain the hash.
+	 * A filter keeps at least one slot empty (a table with no empty slot has
+	 * no cluster boundaries, so lookups cannot terminate), so it holds at most
+	 * capacity() = 2^q - 1 entries.
 	 */
 	bool insert(uint64_t hash);
 
@@ -58,14 +81,33 @@ public:
 	bool may_contain(uint64_t hash) const;
 
 	/*
-	 * Initializes copies over all elements from another QuotientFilter.
+	 * Inserts every entry of `other` into this filter, in place.
+	 *
+	 * A filter only remembers the low q+r bits of each hash, so `other` must
+	 * carry at least as many fingerprint bits as this filter uses
+	 * (other.q + other.r >= q + r); merging from a filter with fewer bits would
+	 * store fingerprints that lookups can never match. Throws
+	 * InvalidInputException if that does not hold, or if this filter fills up.
 	 */
-	QuotientFilter merge(const QuotientFilter &other) const;
+	void merge_from(const QuotientFilter &other);
 
 	/*
 	 * Resets the QF table. This function does not deallocate any memory.
 	 */
 	void clear();
+
+	uint32_t q() const {
+		return values.qbits;
+	}
+	uint32_t r() const {
+		return values.rbits;
+	}
+	uint64_t entries() const {
+		return values.entries;
+	}
+	uint64_t capacity() const {
+		return values.max_size - 1;
+	}
 
 	/*
 	 * Finds the size (in bytes) of a QF table.
@@ -85,6 +127,18 @@ public:
 	static size_t table_elements(const QuotientFilterValues &values);
 
 	/*
+	 * Size of a serialized filter with these parameters: the header plus the
+	 * table as whole 64-bit words.
+	 */
+	static size_t serialized_size(uint32_t q, uint32_t r);
+	size_t serialized_size() const {
+		return serialized_size(values.qbits, values.rbits);
+	}
+
+	/* Writes serialized_size() bytes to `out`. */
+	void serialize_into(char *out) const;
+
+	/*
 	 * Throws if `data` is not a well-formed serialization produced by
 	 * serialize(). Every deserializing constructor runs this first: the header
 	 * is copied verbatim out of the BLOB, and an inconsistent one would make
@@ -96,7 +150,16 @@ public:
 
 private:
 	QuotientFilterValues values;
-	std::vector<uint64_t> table;
+	// The table as table_elements() 64-bit words. Either `owned_table` (a
+	// writable, aligned table this filter allocated) or a read-only view of a
+	// BLOB, which carries no alignment guarantee -- so words are always
+	// accessed through load_word/store_word rather than as uint64_t.
+	duckdb::AllocatedData owned_table;
+	duckdb::const_data_ptr_t table;
+
+	void allocate_table(duckdb::Allocator &allocator);
+	uint64_t load_word(size_t idx) const;
+	void store_word(size_t idx, uint64_t word);
 
 	void set_elem(uint64_t idx, uint64_t elt);
 	uint64_t get_elem(uint64_t idx) const;
@@ -107,26 +170,6 @@ private:
 	uint64_t find_run_index(uint64_t fq) const;
 	void insert_into(uint64_t s, uint64_t elt);
 	void delete_entry(uint64_t s, uint64_t quot);
-
-public:
-	[[nodiscard]] std::string serialize() const {
-		// Serialize the QuotientFilter to a string
-		size_t table_bytes = table_size(values);
-		size_t needed_bytes = sizeof(QuotientFilterValues) + table_bytes;
-		std::string out(needed_bytes, '\0');
-		memcpy((char *)out.data(), &values, sizeof(QuotientFilterValues));
-		// Copy the table by byte count, not by element count: the two are only
-		// the same for tables built by the (q, r) constructor, and copying
-		// table.size() bytes truncates a filter that was itself deserialized.
-		memcpy((char *)out.data() + sizeof(QuotientFilterValues), table.data(), table_bytes);
-		return out;
-	}
-
-	[[nodiscard]] static QuotientFilter deserialize(const std::string &data) {
-		// Deserialize the QuotientFilter from a string
-		QuotientFilter qf(data);
-		return qf;
-	}
 };
 
 class QuotientFilterIterator {

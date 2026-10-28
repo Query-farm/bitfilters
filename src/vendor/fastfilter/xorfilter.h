@@ -7,6 +7,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+// bitfilters: allocations go through these macros so the extension can charge them to
+// DuckDB's memory_limit (see bitfilters_memory.hpp). They default to the C allocator.
+#ifndef FASTFILTER_MALLOC
+#define FASTFILTER_MALLOC(size) malloc(size)
+#endif
+#ifndef FASTFILTER_CALLOC
+#define FASTFILTER_CALLOC(count, size) calloc(count, size)
+#endif
+#ifndef FASTFILTER_FREE
+#define FASTFILTER_FREE(pointer) free(pointer)
+#endif
+
 #ifndef XOR_SORT_ITERATIONS
 #define XOR_SORT_ITERATIONS 10 // after 10 iterations, we sort and remove duplicates
 #endif
@@ -127,7 +139,7 @@ static inline bool xor16_contain(uint64_t key, const xor16_t *filter) {
 static inline bool xor8_allocate(uint32_t size, xor8_t *filter) {
 	size_t capacity = (size_t)(32 + 1.23 * size);
 	capacity = capacity / 3 * 3;
-	filter->fingerprints = (uint8_t *)malloc(capacity * sizeof(uint8_t));
+	filter->fingerprints = (uint8_t *)FASTFILTER_MALLOC(capacity * sizeof(uint8_t));
 	if (filter->fingerprints != NULL) {
 		filter->blockLength = capacity / 3;
 		return true;
@@ -140,7 +152,7 @@ static inline bool xor8_allocate(uint32_t size, xor8_t *filter) {
 static inline bool xor16_allocate(uint32_t size, xor16_t *filter) {
 	size_t capacity = (size_t)(32 + 1.23 * size);
 	capacity = capacity / 3 * 3;
-	filter->fingerprints = (uint16_t *)malloc(capacity * sizeof(uint16_t));
+	filter->fingerprints = (uint16_t *)FASTFILTER_MALLOC(capacity * sizeof(uint16_t));
 	if (filter->fingerprints != NULL) {
 		filter->blockLength = capacity / 3;
 		return true;
@@ -160,14 +172,14 @@ static inline size_t xor16_size_in_bytes(const xor16_t *filter) {
 
 // release memory
 static inline void xor8_free(xor8_t *filter) {
-	free(filter->fingerprints);
+	FASTFILTER_FREE(filter->fingerprints);
 	filter->fingerprints = NULL;
 	filter->blockLength = 0;
 }
 
 // release memory
 static inline void xor16_free(xor16_t *filter) {
-	free(filter->fingerprints);
+	FASTFILTER_FREE(filter->fingerprints);
 	filter->fingerprints = NULL;
 	filter->blockLength = 0;
 }
@@ -271,11 +283,11 @@ static inline bool xor_init_buffer(xor_setbuffer_t *buffer, size_t size) {
 	buffer->insignificantbits = 18;
 	buffer->slotsize = UINT32_C(1) << (uint32_t)buffer->insignificantbits;
 	buffer->slotcount = (uint32_t)(size + buffer->slotsize - 1) / buffer->slotsize;
-	buffer->buffer = (xor_keyindex_t *)malloc((size_t)buffer->slotcount * buffer->slotsize * sizeof(xor_keyindex_t));
-	buffer->counts = (uint32_t *)malloc(buffer->slotcount * sizeof(uint32_t));
+	buffer->buffer = (xor_keyindex_t *)FASTFILTER_MALLOC((size_t)buffer->slotcount * buffer->slotsize * sizeof(xor_keyindex_t));
+	buffer->counts = (uint32_t *)FASTFILTER_MALLOC(buffer->slotcount * sizeof(uint32_t));
 	if ((buffer->counts == NULL) || (buffer->buffer == NULL)) {
-		free(buffer->counts);
-		free(buffer->buffer);
+		FASTFILTER_FREE(buffer->counts);
+		FASTFILTER_FREE(buffer->buffer);
 		return false;
 	}
 	memset(buffer->counts, 0, buffer->slotcount * sizeof(uint32_t));
@@ -283,8 +295,8 @@ static inline bool xor_init_buffer(xor_setbuffer_t *buffer, size_t size) {
 }
 
 static inline void xor_free_buffer(xor_setbuffer_t *buffer) {
-	free(buffer->counts);
-	free(buffer->buffer);
+	FASTFILTER_FREE(buffer->counts);
+	FASTFILTER_FREE(buffer->buffer);
 	buffer->counts = NULL;
 	buffer->buffer = NULL;
 }
@@ -440,20 +452,20 @@ static inline bool xor8_buffered_populate(uint64_t *keys, uint32_t size, xor8_t 
 		return false;
 	}
 
-	xor_xorset_t *sets = (xor_xorset_t *)malloc(arrayLength * sizeof(xor_xorset_t));
+	xor_xorset_t *sets = (xor_xorset_t *)FASTFILTER_MALLOC(arrayLength * sizeof(xor_xorset_t));
 	xor_xorset_t *sets0 = sets;
 
-	xor_keyindex_t *Q = (xor_keyindex_t *)malloc(arrayLength * sizeof(xor_keyindex_t));
+	xor_keyindex_t *Q = (xor_keyindex_t *)FASTFILTER_MALLOC(arrayLength * sizeof(xor_keyindex_t));
 
-	xor_keyindex_t *stack = (xor_keyindex_t *)malloc(size * sizeof(xor_keyindex_t));
+	xor_keyindex_t *stack = (xor_keyindex_t *)FASTFILTER_MALLOC(size * sizeof(xor_keyindex_t));
 
 	if ((sets == NULL) || (Q == NULL) || (stack == NULL)) {
 		xor_free_buffer(&buffer0);
 		xor_free_buffer(&buffer1);
 		xor_free_buffer(&buffer2);
-		free(sets);
-		free(Q);
-		free(stack);
+		FASTFILTER_FREE(sets);
+		FASTFILTER_FREE(Q);
+		FASTFILTER_FREE(stack);
 		return false;
 	}
 	xor_xorset_t *sets1 = sets + blockLength;
@@ -475,9 +487,9 @@ static inline bool xor8_buffered_populate(uint64_t *keys, uint32_t size, xor8_t 
 			xor_free_buffer(&buffer0);
 			xor_free_buffer(&buffer1);
 			xor_free_buffer(&buffer2);
-			free(sets);
-			free(Q);
-			free(stack);
+			FASTFILTER_FREE(sets);
+			FASTFILTER_FREE(Q);
+			FASTFILTER_FREE(stack);
 			return false;
 		}
 		memset(sets, 0, sizeof(xor_xorset_t) * arrayLength);
@@ -614,9 +626,9 @@ static inline bool xor8_buffered_populate(uint64_t *keys, uint32_t size, xor8_t 
 	xor_free_buffer(&buffer1);
 	xor_free_buffer(&buffer2);
 
-	free(sets);
-	free(Q);
-	free(stack);
+	FASTFILTER_FREE(sets);
+	FASTFILTER_FREE(Q);
+	FASTFILTER_FREE(stack);
 	return true;
 }
 
@@ -634,16 +646,16 @@ static inline bool xor8_populate(uint64_t *keys, uint32_t size, xor8_t *filter) 
 	size_t arrayLength = (size_t)(filter->blockLength) * 3; // size of the backing array
 	size_t blockLength = (size_t)(filter->blockLength);
 
-	xor_xorset_t *sets = (xor_xorset_t *)malloc(arrayLength * sizeof(xor_xorset_t));
+	xor_xorset_t *sets = (xor_xorset_t *)FASTFILTER_MALLOC(arrayLength * sizeof(xor_xorset_t));
 
-	xor_keyindex_t *Q = (xor_keyindex_t *)malloc(arrayLength * sizeof(xor_keyindex_t));
+	xor_keyindex_t *Q = (xor_keyindex_t *)FASTFILTER_MALLOC(arrayLength * sizeof(xor_keyindex_t));
 
-	xor_keyindex_t *stack = (xor_keyindex_t *)malloc(size * sizeof(xor_keyindex_t));
+	xor_keyindex_t *stack = (xor_keyindex_t *)FASTFILTER_MALLOC(size * sizeof(xor_keyindex_t));
 
 	if ((sets == NULL) || (Q == NULL) || (stack == NULL)) {
-		free(sets);
-		free(Q);
-		free(stack);
+		FASTFILTER_FREE(sets);
+		FASTFILTER_FREE(Q);
+		FASTFILTER_FREE(stack);
 		return false;
 	}
 	xor_xorset_t *sets0 = sets;
@@ -663,9 +675,9 @@ static inline bool xor8_populate(uint64_t *keys, uint32_t size, xor8_t *filter) 
 		if (iterations > XOR_MAX_ITERATIONS) {
 			// The probability of this happening is lower than the
 			// the cosmic-ray probability (i.e., a cosmic ray corrupts your system).
-			free(sets);
-			free(Q);
-			free(stack);
+			FASTFILTER_FREE(sets);
+			FASTFILTER_FREE(Q);
+			FASTFILTER_FREE(stack);
 			return false;
 		}
 
@@ -818,9 +830,9 @@ static inline bool xor8_populate(uint64_t *keys, uint32_t size, xor8_t *filter) 
 		filter->fingerprints[ki.index] = (uint8_t)val;
 	}
 
-	free(sets);
-	free(Q);
-	free(stack);
+	FASTFILTER_FREE(sets);
+	FASTFILTER_FREE(Q);
+	FASTFILTER_FREE(stack);
 	return true;
 }
 
@@ -848,19 +860,19 @@ static inline bool xor16_buffered_populate(uint64_t *keys, uint32_t size, xor16_
 		return false;
 	}
 
-	xor_xorset_t *sets = (xor_xorset_t *)malloc(arrayLength * sizeof(xor_xorset_t));
+	xor_xorset_t *sets = (xor_xorset_t *)FASTFILTER_MALLOC(arrayLength * sizeof(xor_xorset_t));
 
-	xor_keyindex_t *Q = (xor_keyindex_t *)malloc(arrayLength * sizeof(xor_keyindex_t));
+	xor_keyindex_t *Q = (xor_keyindex_t *)FASTFILTER_MALLOC(arrayLength * sizeof(xor_keyindex_t));
 
-	xor_keyindex_t *stack = (xor_keyindex_t *)malloc(size * sizeof(xor_keyindex_t));
+	xor_keyindex_t *stack = (xor_keyindex_t *)FASTFILTER_MALLOC(size * sizeof(xor_keyindex_t));
 
 	if ((sets == NULL) || (Q == NULL) || (stack == NULL)) {
 		xor_free_buffer(&buffer0);
 		xor_free_buffer(&buffer1);
 		xor_free_buffer(&buffer2);
-		free(sets);
-		free(Q);
-		free(stack);
+		FASTFILTER_FREE(sets);
+		FASTFILTER_FREE(Q);
+		FASTFILTER_FREE(stack);
 		return false;
 	}
 	xor_xorset_t *sets0 = sets;
@@ -883,9 +895,9 @@ static inline bool xor16_buffered_populate(uint64_t *keys, uint32_t size, xor16_
 			xor_free_buffer(&buffer0);
 			xor_free_buffer(&buffer1);
 			xor_free_buffer(&buffer2);
-			free(sets);
-			free(Q);
-			free(stack);
+			FASTFILTER_FREE(sets);
+			FASTFILTER_FREE(Q);
+			FASTFILTER_FREE(stack);
 			return false;
 		}
 
@@ -1026,9 +1038,9 @@ static inline bool xor16_buffered_populate(uint64_t *keys, uint32_t size, xor16_
 	xor_free_buffer(&buffer1);
 	xor_free_buffer(&buffer2);
 
-	free(sets);
-	free(Q);
-	free(stack);
+	FASTFILTER_FREE(sets);
+	FASTFILTER_FREE(Q);
+	FASTFILTER_FREE(stack);
 	return true;
 }
 
@@ -1046,16 +1058,16 @@ static inline bool xor16_populate(uint64_t *keys, uint32_t size, xor16_t *filter
 	size_t arrayLength = (size_t)(filter->blockLength) * 3; // size of the backing array
 	size_t blockLength = (size_t)(filter->blockLength);
 
-	xor_xorset_t *sets = (xor_xorset_t *)malloc(arrayLength * sizeof(xor_xorset_t));
+	xor_xorset_t *sets = (xor_xorset_t *)FASTFILTER_MALLOC(arrayLength * sizeof(xor_xorset_t));
 
-	xor_keyindex_t *Q = (xor_keyindex_t *)malloc(arrayLength * sizeof(xor_keyindex_t));
+	xor_keyindex_t *Q = (xor_keyindex_t *)FASTFILTER_MALLOC(arrayLength * sizeof(xor_keyindex_t));
 
-	xor_keyindex_t *stack = (xor_keyindex_t *)malloc(size * sizeof(xor_keyindex_t));
+	xor_keyindex_t *stack = (xor_keyindex_t *)FASTFILTER_MALLOC(size * sizeof(xor_keyindex_t));
 
 	if ((sets == NULL) || (Q == NULL) || (stack == NULL)) {
-		free(sets);
-		free(Q);
-		free(stack);
+		FASTFILTER_FREE(sets);
+		FASTFILTER_FREE(Q);
+		FASTFILTER_FREE(stack);
 		return false;
 	}
 	xor_xorset_t *sets0 = sets;
@@ -1076,9 +1088,9 @@ static inline bool xor16_populate(uint64_t *keys, uint32_t size, xor16_t *filter
 		if (iterations > XOR_MAX_ITERATIONS) {
 			// The probability of this happening is lower than the
 			// the cosmic-ray probability (i.e., a cosmic ray corrupts your system).
-			free(sets);
-			free(Q);
-			free(stack);
+			FASTFILTER_FREE(sets);
+			FASTFILTER_FREE(Q);
+			FASTFILTER_FREE(stack);
 			return false;
 		}
 
@@ -1234,9 +1246,9 @@ static inline bool xor16_populate(uint64_t *keys, uint32_t size, xor16_t *filter
 		filter->fingerprints[ki.index] = (uint16_t)val;
 	}
 
-	free(sets);
-	free(Q);
-	free(stack);
+	FASTFILTER_FREE(sets);
+	FASTFILTER_FREE(Q);
+	FASTFILTER_FREE(stack);
 	return true;
 }
 
@@ -1280,7 +1292,7 @@ static inline bool xor16_deserialize(xor16_t *filter, const char *buffer) {
 	buffer += sizeof(filter->seed);
 	memcpy(&filter->blockLength, buffer, sizeof(filter->blockLength));
 	buffer += sizeof(filter->blockLength);
-	filter->fingerprints = (uint16_t *)malloc((size_t)(filter->blockLength) * 3 * sizeof(uint16_t));
+	filter->fingerprints = (uint16_t *)FASTFILTER_MALLOC((size_t)(filter->blockLength) * 3 * sizeof(uint16_t));
 	if (filter->fingerprints == NULL) {
 		return false;
 	}
@@ -1306,7 +1318,7 @@ static inline bool xor8_deserialize(xor8_t *filter, const char *buffer) {
 	buffer += sizeof(filter->seed);
 	memcpy(&filter->blockLength, buffer, sizeof(filter->blockLength));
 	buffer += sizeof(filter->blockLength);
-	filter->fingerprints = (uint8_t *)malloc((size_t)(filter->blockLength) * 3 * sizeof(uint8_t));
+	filter->fingerprints = (uint8_t *)FASTFILTER_MALLOC((size_t)(filter->blockLength) * 3 * sizeof(uint8_t));
 	if (filter->fingerprints == NULL) {
 		return false;
 	}
@@ -1394,7 +1406,7 @@ static inline void xor8_deserialize_no_copy(xor8_t *filter, const char *buffer) 
 		XOR_deser(filter->seed, buf, e);                                                                               \
 		XOR_deser(filter->blockLength, buf, e);                                                                        \
 		size_t capacity = (size_t)(3 * filter->blockLength);                                                           \
-		filter->fingerprints = (uint##xbits##_t *)calloc(capacity, sizeof filter->fingerprints[0]);                    \
+		filter->fingerprints = (uint##xbits##_t *)FASTFILTER_CALLOC(capacity, sizeof filter->fingerprints[0]);                    \
 		if (filter->fingerprints == NULL)                                                                              \
 			return (false);                                                                                            \
 		const uint8_t *bitf = buf;                                                                                     \

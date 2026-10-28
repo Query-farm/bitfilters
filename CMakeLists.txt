@@ -23,6 +23,7 @@ src/bitfilters_quotient_filter.cpp
 src/bitfilters_xor_filter.cpp
 src/bitfilters_binary_fuse_filter.cpp
 src/bitfilters_duckdb_bloom_filter.cpp
+src/bitfilters_memory.cpp
 src/vendor/quotient-filter/quotient_filter.cpp
 src/query_farm_telemetry.cpp)
 

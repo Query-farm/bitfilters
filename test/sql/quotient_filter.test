@@ -174,17 +174,27 @@ from full_sample, (select quotient_filter(16, 4, k) as f from full_sample where 
 statement error
 select quotient_filter(0, 4, hash(i)) from range(10) t(i);
 ----
-capacity must be greater than 0
+q must be between 1 and 63
 
 statement error
 select quotient_filter(16, 0, hash(i)) from range(10) t(i);
 ----
-r must be greater than 0
+r must be between 1 and 63
 
 statement error
 select quotient_filter(60, 60, hash(i)) from range(10) t(i);
 ----
-q+r must be between 0 and 64
+q + r must be at most 64
+
+statement error
+select quotient_filter(40, 30, hash(i)) from range(10) t(i);
+----
+q + r must be at most 64
+
+statement error
+select quotient_filter(-1, 8, hash(i)) from range(10) t(i);
+----
+q must be between 1 and 63
 
 # q = 40 would need a 962GB table; that used to be allocated and take the
 # process down with it
@@ -288,6 +298,85 @@ select quotient_filter(16, 4, f) from (select xor8_filter(hash(i)) as f from ran
 ----
 quotient filter BLOB
 
+statement ok
+create or replace table merge_parts as
+  select i % 4 as p, quotient_filter(16, 8, hash(i)) as f from range(20000) t(i) group by p;
+
+# A filter only keeps the low q + r bits of each hash. Merging into a filter
+# that needs more bits than its inputs kept used to store truncated
+# fingerprints and miss almost every value; it is now an error.
+statement error
+select quotient_filter(20, 8, f) from merge_parts;
+----
+the input keeps 24 bits of each hash but the result needs 28
+
+# growing q by giving up the same number of remainder bits is exact
+query I
+select count(*) filter (where not quotient_filter_contains(m, hash(i)))
+from range(20000) t(i), (select quotient_filter(20, 4, f) as m from merge_parts);
+----
+0
+
+# so is shrinking the filter
+query I
+select count(*) filter (where not quotient_filter_contains(m, hash(i)))
+from range(20000) t(i), (select quotient_filter(15, 8, f) as m from merge_parts);
+----
+0
+
+# Merging more values than the result has room for used to drop the overflow
+# silently, and a filter with no empty slot left could not even be read back.
+statement error
+select quotient_filter(10, 8, f)
+from (select i % 4 as p, quotient_filter(12, 8, hash(i)) as f from range(2000) t(i) group by p);
+----
+the merged filter is full (q = 10 holds at most 1023 values)
+
+# overlapping inputs: a value already in the filter is not inserted twice, so
+# merging a filter with itself fits even when the filter is full
+query I
+select count(*) filter (where not quotient_filter_contains(m, hash(i)))
+from range(1023) t(i),
+     (select quotient_filter(10, 8, f) as m
+      from (select quotient_filter(10, 8, hash(i)) as f from range(1023) t(i)), range(3));
+----
+0
+
+# a filter holds at most 2^q - 1 values: one slot always stays empty
+statement ok
+select quotient_filter(4, 8, hash(i)) from range(15) t(i);
+
+statement error
+select quotient_filter(4, 8, hash(i)) from range(16) t(i);
+----
+the filter is full (q = 4 holds at most 15 values)
+
+# the same input builds the same filter no matter how it is split across
+# threads (thread-local filters are merged into one)
+statement ok
+set threads = 8;
+
+statement ok
+create or replace table parallel_filter as
+  select quotient_filter(17, 8, hash(i)) as f from range(120000) t(i);
+
+statement ok
+set threads = 1;
+
+query I
+select (select quotient_filter(17, 8, hash(i)) from range(120000) t(i)) = f from parallel_filter;
+----
+true
+
+query I
+select count(*) filter (where not quotient_filter_contains(f, hash(i)))
+from range(120000) t(i), parallel_filter;
+----
+0
+
+statement ok
+reset threads;
+
 # ---------------------------------------------------------------------------
 # Filters survive a round trip through storage, and are deterministic
 # ---------------------------------------------------------------------------
@@ -310,11 +399,40 @@ select (select quotient_filter(16, 4, hash(i)) from range(1000) t(i)) =
 ----
 true
 
-# 40 byte header plus ceil(2^q * (r + 3) / 8) bytes of table
+# 40 byte header plus the 2^q * (r + 3) bit table, padded to whole 64-bit words
 query I
 select octet_length(quotient_filter(16, 4, hash(i))) from range(1000) t(i);
 ----
 57384
+
+# q = 4, r = 3: a 96 bit table, padded to 128 bits
+query I
+select octet_length(quotient_filter(4, 3, hash(i))) from range(5) t(i);
+----
+56
+
+# Filters written before the padding stored the table rounded to bytes. They
+# are still read (by copying the table instead of reading it in place).
+statement ok
+create or replace table unpadded as
+  select unhex(left(hex(quotient_filter(4, 3, hash(i))), 2 * 52)) as f from range(5) t(i);
+
+query I
+select octet_length(f) from unpadded;
+----
+52
+
+query I
+select count(*) filter (where quotient_filter_contains(f, hash(i))) from range(5) t(i), unpadded;
+----
+5
+
+# and merged
+query I
+select count(*) filter (where quotient_filter_contains(m, hash(i)))
+from range(5) t(i), (select quotient_filter(4, 3, f) as m from unpadded);
+----
+5
 
 # ---------------------------------------------------------------------------
 # Malformed filter BLOBs are rejected with an error instead of reading out of

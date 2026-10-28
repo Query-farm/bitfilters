@@ -7,6 +7,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// bitfilters: allocations go through these macros so the extension can charge them to
+// DuckDB's memory_limit (see bitfilters_memory.hpp). They default to the C allocator.
+#ifndef FASTFILTER_MALLOC
+#define FASTFILTER_MALLOC(size) malloc(size)
+#endif
+#ifndef FASTFILTER_CALLOC
+#define FASTFILTER_CALLOC(count, size) calloc(count, size)
+#endif
+#ifndef FASTFILTER_FREE
+#define FASTFILTER_FREE(pointer) free(pointer)
+#endif
 #ifndef XOR_MAX_ITERATIONS
 // probability of success should always be > 0.5 so 100 iterations is highly unlikely
 #define XOR_MAX_ITERATIONS 100
@@ -233,7 +245,7 @@ static inline bool binary_fuse8_allocate(uint32_t size, binary_fuse8_t *filter) 
 	}
 	filter->ArrayLength = (filter->SegmentCount + arity - 1) * filter->SegmentLength;
 	filter->SegmentCountLength = filter->SegmentCount * filter->SegmentLength;
-	filter->Fingerprints = (uint8_t *)calloc(filter->ArrayLength, sizeof(uint8_t));
+	filter->Fingerprints = (uint8_t *)FASTFILTER_CALLOC(filter->ArrayLength, sizeof(uint8_t));
 	return filter->Fingerprints != NULL;
 }
 
@@ -244,7 +256,7 @@ static inline size_t binary_fuse8_size_in_bytes(const binary_fuse8_t *filter) {
 
 // release memory
 static inline void binary_fuse8_free(binary_fuse8_t *filter) {
-	free(filter->Fingerprints);
+	FASTFILTER_FREE(filter->Fingerprints);
 	filter->Fingerprints = NULL;
 	filter->Seed = 0;
 	filter->Size = 0;
@@ -271,29 +283,29 @@ static inline bool binary_fuse8_populate(uint64_t *keys, uint32_t size, binary_f
 
 	uint64_t rng_counter = 0x726b2b9d438b9d4d;
 	filter->Seed = binary_fuse_rng_splitmix64(&rng_counter);
-	uint64_t *reverseOrder = (uint64_t *)calloc((size + 1), sizeof(uint64_t));
+	uint64_t *reverseOrder = (uint64_t *)FASTFILTER_CALLOC((size + 1), sizeof(uint64_t));
 	uint32_t capacity = filter->ArrayLength;
-	uint32_t *alone = (uint32_t *)malloc(capacity * sizeof(uint32_t));
-	uint8_t *t2count = (uint8_t *)calloc(capacity, sizeof(uint8_t));
-	uint8_t *reverseH = (uint8_t *)malloc(size * sizeof(uint8_t));
-	uint64_t *t2hash = (uint64_t *)calloc(capacity, sizeof(uint64_t));
+	uint32_t *alone = (uint32_t *)FASTFILTER_MALLOC(capacity * sizeof(uint32_t));
+	uint8_t *t2count = (uint8_t *)FASTFILTER_CALLOC(capacity, sizeof(uint8_t));
+	uint8_t *reverseH = (uint8_t *)FASTFILTER_MALLOC(size * sizeof(uint8_t));
+	uint64_t *t2hash = (uint64_t *)FASTFILTER_CALLOC(capacity, sizeof(uint64_t));
 
 	uint32_t blockBits = 1;
 	while (((uint32_t)1 << blockBits) < filter->SegmentCount) {
 		blockBits += 1;
 	}
 	uint32_t block = ((uint32_t)1 << blockBits);
-	uint32_t *startPos = (uint32_t *)malloc((1U << blockBits) * sizeof(uint32_t));
+	uint32_t *startPos = (uint32_t *)FASTFILTER_MALLOC((1U << blockBits) * sizeof(uint32_t));
 	uint32_t h012[5];
 
 	if ((alone == NULL) || (t2count == NULL) || (reverseH == NULL) || (t2hash == NULL) || (reverseOrder == NULL) ||
 	    (startPos == NULL)) {
-		free(alone);
-		free(t2count);
-		free(reverseH);
-		free(t2hash);
-		free(reverseOrder);
-		free(startPos);
+		FASTFILTER_FREE(alone);
+		FASTFILTER_FREE(t2count);
+		FASTFILTER_FREE(reverseH);
+		FASTFILTER_FREE(t2hash);
+		FASTFILTER_FREE(reverseOrder);
+		FASTFILTER_FREE(startPos);
 		return false;
 	}
 	reverseOrder[size] = 1;
@@ -302,12 +314,12 @@ static inline bool binary_fuse8_populate(uint64_t *keys, uint32_t size, binary_f
 			// The probability of this happening is lower than the
 			// the cosmic-ray probability (i.e., a cosmic ray corrupts your system)
 			memset(filter->Fingerprints, 0xFF, filter->ArrayLength);
-			free(alone);
-			free(t2count);
-			free(reverseH);
-			free(t2hash);
-			free(reverseOrder);
-			free(startPos);
+			FASTFILTER_FREE(alone);
+			FASTFILTER_FREE(t2count);
+			FASTFILTER_FREE(reverseH);
+			FASTFILTER_FREE(t2hash);
+			FASTFILTER_FREE(reverseOrder);
+			FASTFILTER_FREE(startPos);
 			return false;
 		}
 
@@ -435,12 +447,12 @@ static inline bool binary_fuse8_populate(uint64_t *keys, uint32_t size, binary_f
 		filter->Fingerprints[h012[found]] =
 		    (uint8_t)((uint32_t)xor2 ^ filter->Fingerprints[h012[found + 1]] ^ filter->Fingerprints[h012[found + 2]]);
 	}
-	free(alone);
-	free(t2count);
-	free(reverseH);
-	free(t2hash);
-	free(reverseOrder);
-	free(startPos);
+	FASTFILTER_FREE(alone);
+	FASTFILTER_FREE(t2count);
+	FASTFILTER_FREE(reverseH);
+	FASTFILTER_FREE(t2hash);
+	FASTFILTER_FREE(reverseOrder);
+	FASTFILTER_FREE(startPos);
 	return true;
 }
 
@@ -515,7 +527,7 @@ static inline bool binary_fuse16_allocate(uint32_t size, binary_fuse16_t *filter
 	}
 	filter->ArrayLength = (filter->SegmentCount + arity - 1) * filter->SegmentLength;
 	filter->SegmentCountLength = filter->SegmentCount * filter->SegmentLength;
-	filter->Fingerprints = (uint16_t *)calloc(filter->ArrayLength, sizeof(uint16_t));
+	filter->Fingerprints = (uint16_t *)FASTFILTER_CALLOC(filter->ArrayLength, sizeof(uint16_t));
 	return filter->Fingerprints != NULL;
 }
 
@@ -526,7 +538,7 @@ static inline size_t binary_fuse16_size_in_bytes(const binary_fuse16_t *filter) 
 
 // release memory
 static inline void binary_fuse16_free(binary_fuse16_t *filter) {
-	free(filter->Fingerprints);
+	FASTFILTER_FREE(filter->Fingerprints);
 	filter->Fingerprints = NULL;
 	filter->Seed = 0;
 	filter->Size = 0;
@@ -549,29 +561,29 @@ static inline bool binary_fuse16_populate(uint64_t *keys, uint32_t size, binary_
 
 	uint64_t rng_counter = 0x726b2b9d438b9d4d;
 	filter->Seed = binary_fuse_rng_splitmix64(&rng_counter);
-	uint64_t *reverseOrder = (uint64_t *)calloc((size + 1), sizeof(uint64_t));
+	uint64_t *reverseOrder = (uint64_t *)FASTFILTER_CALLOC((size + 1), sizeof(uint64_t));
 	uint32_t capacity = filter->ArrayLength;
-	uint32_t *alone = (uint32_t *)malloc(capacity * sizeof(uint32_t));
-	uint8_t *t2count = (uint8_t *)calloc(capacity, sizeof(uint8_t));
-	uint8_t *reverseH = (uint8_t *)malloc(size * sizeof(uint8_t));
-	uint64_t *t2hash = (uint64_t *)calloc(capacity, sizeof(uint64_t));
+	uint32_t *alone = (uint32_t *)FASTFILTER_MALLOC(capacity * sizeof(uint32_t));
+	uint8_t *t2count = (uint8_t *)FASTFILTER_CALLOC(capacity, sizeof(uint8_t));
+	uint8_t *reverseH = (uint8_t *)FASTFILTER_MALLOC(size * sizeof(uint8_t));
+	uint64_t *t2hash = (uint64_t *)FASTFILTER_CALLOC(capacity, sizeof(uint64_t));
 
 	uint32_t blockBits = 1;
 	while (((uint32_t)1 << blockBits) < filter->SegmentCount) {
 		blockBits += 1;
 	}
 	uint32_t block = ((uint32_t)1 << blockBits);
-	uint32_t *startPos = (uint32_t *)malloc((1U << blockBits) * sizeof(uint32_t));
+	uint32_t *startPos = (uint32_t *)FASTFILTER_MALLOC((1U << blockBits) * sizeof(uint32_t));
 	uint32_t h012[5];
 
 	if ((alone == NULL) || (t2count == NULL) || (reverseH == NULL) || (t2hash == NULL) || (reverseOrder == NULL) ||
 	    (startPos == NULL)) {
-		free(alone);
-		free(t2count);
-		free(reverseH);
-		free(t2hash);
-		free(reverseOrder);
-		free(startPos);
+		FASTFILTER_FREE(alone);
+		FASTFILTER_FREE(t2count);
+		FASTFILTER_FREE(reverseH);
+		FASTFILTER_FREE(t2hash);
+		FASTFILTER_FREE(reverseOrder);
+		FASTFILTER_FREE(startPos);
 		return false;
 	}
 	reverseOrder[size] = 1;
@@ -579,12 +591,12 @@ static inline bool binary_fuse16_populate(uint64_t *keys, uint32_t size, binary_
 		if (loop + 1 > XOR_MAX_ITERATIONS) {
 			// The probability of this happening is lower than the
 			// the cosmic-ray probability (i.e., a cosmic ray corrupts your system).
-			free(alone);
-			free(t2count);
-			free(reverseH);
-			free(t2hash);
-			free(reverseOrder);
-			free(startPos);
+			FASTFILTER_FREE(alone);
+			FASTFILTER_FREE(t2count);
+			FASTFILTER_FREE(reverseH);
+			FASTFILTER_FREE(t2hash);
+			FASTFILTER_FREE(reverseOrder);
+			FASTFILTER_FREE(startPos);
 			return false;
 		}
 
@@ -713,12 +725,12 @@ static inline bool binary_fuse16_populate(uint64_t *keys, uint32_t size, binary_
 		    (uint16_t)((uint32_t)xor2 ^ (uint32_t)filter->Fingerprints[h012[found + 1]] ^
 		               (uint32_t)filter->Fingerprints[h012[found + 2]]);
 	}
-	free(alone);
-	free(t2count);
-	free(reverseH);
-	free(t2hash);
-	free(reverseOrder);
-	free(startPos);
+	FASTFILTER_FREE(alone);
+	FASTFILTER_FREE(t2count);
+	FASTFILTER_FREE(reverseH);
+	FASTFILTER_FREE(t2hash);
+	FASTFILTER_FREE(reverseOrder);
+	FASTFILTER_FREE(startPos);
 	return true;
 }
 
@@ -800,7 +812,7 @@ static inline const char *binary_fuse16_deserialize_header(binary_fuse16_t *filt
 // Native endianess only.
 static inline bool binary_fuse16_deserialize(binary_fuse16_t *filter, const char *buffer) {
 	const char *fingerprints = binary_fuse16_deserialize_header(filter, buffer);
-	filter->Fingerprints = (uint16_t *)malloc(filter->ArrayLength * sizeof(uint16_t));
+	filter->Fingerprints = (uint16_t *)FASTFILTER_MALLOC(filter->ArrayLength * sizeof(uint16_t));
 	if (filter->Fingerprints == NULL) {
 		return false;
 	}
@@ -837,7 +849,7 @@ static inline const char *binary_fuse8_deserialize_header(binary_fuse8_t *filter
 // Native endianess only.
 static inline bool binary_fuse8_deserialize(binary_fuse8_t *filter, const char *buffer) {
 	const char *fingerprints = binary_fuse8_deserialize_header(filter, buffer);
-	filter->Fingerprints = (uint8_t *)malloc(filter->ArrayLength * sizeof(uint8_t));
+	filter->Fingerprints = (uint8_t *)FASTFILTER_MALLOC(filter->ArrayLength * sizeof(uint8_t));
 	if (filter->Fingerprints == NULL) {
 		return false;
 	}

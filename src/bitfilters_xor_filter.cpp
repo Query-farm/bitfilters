@@ -173,13 +173,6 @@ void DeserializeFilter(FilterType &filter, const string_t &blob) {
 	Traits::SetFingerprints(&filter, data + XOR_HEADER_BYTES);
 }
 
-struct XorFilterState {
-	// Raw pointer rather than unique_ptr: aggregate states are handed to us as
-	// uninitialized memory, so a smart pointer's assignment operator would run
-	// over (and try to free) a garbage pointer.
-	std::vector<uint64_t> *entries;
-};
-
 // Frees the vendored filter's fingerprint array when Finalize leaves early via
 // an exception.
 template <typename FilterType>
@@ -193,76 +186,39 @@ struct XorFilterGuard {
 };
 
 template <typename FilterType>
-struct XorFilterCreateOperation {
+struct XorFilterCreateOperation : BitfiltersKeyCollectOperation {
 	using Traits = XorTraits<FilterType>;
-
-	template <class STATE>
-	static void Initialize(STATE &state) {
-		state.entries = nullptr;
-	}
-
-	static bool IgnoreNull() {
-		return true;
-	}
-
-	template <class STATE>
-	static void Destroy(STATE &state, AggregateInputData &) {
-		delete state.entries;
-		state.entries = nullptr;
-	}
-
-	template <class STATE>
-	static std::vector<uint64_t> &Entries(STATE &state) {
-		if (!state.entries) {
-			state.entries = new std::vector<uint64_t>();
-		}
-		return *state.entries;
-	}
-
-	template <class A_TYPE, class STATE, class OP>
-	static void Operation(STATE &state, const A_TYPE &a_data, AggregateUnaryInput &) {
-		Entries(state).push_back(a_data);
-	}
-
-	template <class INPUT_TYPE, class STATE, class OP>
-	static void ConstantOperation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &, idx_t count) {
-		auto &entries = Entries(state);
-		entries.insert(entries.end(), count, input);
-	}
-
-	template <class STATE, class OP>
-	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
-		if (!source.entries || source.entries->empty()) {
-			return;
-		}
-		auto &target_entries = Entries(target);
-		target_entries.reserve(target_entries.size() + source.entries->size());
-		target_entries.insert(target_entries.end(), source.entries->begin(), source.entries->end());
-	}
 
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
-		if (!state.entries || state.entries->empty()) {
+		auto &keys = state.keys;
+		if (keys.total_capacity == 0) {
 			finalize_data.ReturnNull();
 			return;
 		}
-		auto &entries = *state.entries;
-		if (entries.size() > NumericLimits<uint32_t>::Maximum()) {
+		if (keys.total_capacity > NumericLimits<uint32_t>::Maximum()) {
 			throw OutOfRangeException("%s_filter: cannot build a filter over %llu values, the maximum is %u",
-			                          Traits::Name(), static_cast<uint64_t>(entries.size()),
+			                          Traits::Name(), static_cast<uint64_t>(keys.total_capacity),
 			                          NumericLimits<uint32_t>::Maximum());
 		}
-		const auto count = static_cast<uint32_t>(entries.size());
+		const auto count = static_cast<uint32_t>(keys.total_capacity);
+
+		// The construction's scratch space and the filter itself are charged
+		// to memory_limit like the collected keys.
+		BitfiltersFastFilterAllocationScope allocation_scope(BitfiltersStateAllocator(finalize_data.input));
+		// The construction may reorder and de-duplicate the keys in place, so
+		// it works on a copy and the state stays intact.
+		auto key_array = GatherKeys(keys, allocation_scope.GetAllocator());
 
 		FilterType filter;
 		if (!Traits::Allocate(count, &filter)) {
+			allocation_scope.ThrowIfFailed();
 			throw OutOfMemoryException("%s_filter: failed to allocate a filter for %u values", Traits::Name(), count);
 		}
 		XorFilterGuard<FilterType> guard(filter);
 
-		// Populate may reorder `entries` in place, which is fine -- the state is
-		// dead once we have finalized it.
-		if (!Traits::Populate(entries.data(), count, &filter)) {
+		if (!Traits::Populate(reinterpret_cast<uint64_t *>(key_array.get()), count, &filter)) {
+			allocation_scope.ThrowIfFailed();
 			throw InvalidInputException(
 			    "%s_filter: failed to construct a filter over %u values. This is usually caused by running out of "
 			    "memory, or by an input distribution the construction algorithm could not resolve.",
@@ -275,19 +231,18 @@ struct XorFilterCreateOperation {
 			                          "BLOB size of %u bytes",
 			                          Traits::Name(), exact_size, NumericLimits<uint32_t>::Maximum());
 		}
-		const auto buffer_size = Traits::SerializationBytes(&filter);
-		D_ASSERT(buffer_size >= exact_size);
-		std::vector<char> buffer(buffer_size);
-		Traits::Serialize(&filter, buffer.data());
-		target = StringVector::AddStringOrBlob(finalize_data.result, buffer.data(), exact_size);
+		// Serialize straight into the result rather than through a scratch
+		// copy of the whole filter.
+		D_ASSERT(Traits::SerializationBytes(&filter) == exact_size);
+		target = StringVector::EmptyString(finalize_data.result, exact_size);
+		Traits::Serialize(&filter, target.GetDataWriteable());
+		target.Finalize();
 	}
 };
 
 template <typename T, typename FilterType>
 auto static XorFilterCreateAggregate(const LogicalType &type, const LogicalType &result_type) -> AggregateFunction {
-	auto aggregate =
-	    AggregateFunction::UnaryAggregate<XorFilterState, T, string_t, XorFilterCreateOperation<FilterType>,
-	                                      AggregateDestructorType::LEGACY>(type, result_type);
+	auto aggregate = BitfiltersKeyAggregate<XorFilterCreateOperation<FilterType>>(type, result_type);
 	aggregate.SetFallible();
 	return aggregate;
 }

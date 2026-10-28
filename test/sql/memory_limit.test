@@ -1,0 +1,116 @@
+# name: test/sql/memory_limit.test
+# description: filter construction is charged to memory_limit and fails cleanly when it does not fit
+# group: [sql]
+
+require bitfilters
+
+statement ok
+set threads = 4;
+
+statement ok
+set memory_limit = '64MB';
+
+# 20 million keys need 160MB just to collect, before the filter is built. These
+# used to allocate outside DuckDB's buffer manager, ignore memory_limit, and
+# grow the process until the operating system stepped in.
+statement error
+select xor8_filter(hash(i)) from range(20000000) t(i);
+----
+Out of Memory Error
+
+statement error
+select xor16_filter(hash(i)) from range(20000000) t(i);
+----
+Out of Memory Error
+
+statement error
+select binary_fuse8_filter(hash(i)) from range(20000000) t(i);
+----
+Out of Memory Error
+
+statement error
+select binary_fuse16_filter(hash(i)) from range(20000000) t(i);
+----
+Out of Memory Error
+
+# q = 26, r = 8: a 88MB table
+statement error
+select quotient_filter(26, 8, hash(i)) from range(10) t(i);
+----
+Out of Memory Error
+
+# merging allocates the result's table the same way
+statement error
+select quotient_filter(26, 8, f) from (select quotient_filter(10, 24, hash(i)) as f from range(10) t(i));
+----
+Out of Memory Error
+
+
+# Nothing stays charged to the buffer pool after a failed build -- not the
+# collected keys, not the construction's scratch space.
+query I
+select count(*) from duckdb_memory() where tag = 'ALLOCATOR' and memory_usage_bytes > 0;
+----
+0
+
+# The same builds succeed once they fit.
+statement ok
+set memory_limit = '2GB';
+
+query I
+select octet_length(xor8_filter(hash(i))) > 0 from range(2000000) t(i);
+----
+true
+
+query I
+select octet_length(binary_fuse16_filter(hash(i))) > 0 from range(2000000) t(i);
+----
+true
+
+query I
+select count(*) filter (where not quotient_filter_contains(f, hash(i)))
+from range(100000) t(i), (select quotient_filter(18, 8, hash(i)) as f from range(100000) t(i));
+----
+0
+
+# grouped builds combine thread-local states; every group still holds every key
+statement ok
+create or replace table grouped_filters as
+  select i % 64 as g, xor8_filter(hash(i)) as x, binary_fuse8_filter(hash(i)) as b, quotient_filter(14, 8, hash(i)) as q
+  from range(500000) t(i) group by g;
+
+query III
+select count(*) filter (where not xor8_filter_contains(x, hash(i))),
+       count(*) filter (where not binary_fuse8_filter_contains(b, hash(i))),
+       count(*) filter (where not quotient_filter_contains(q, hash(i)))
+from range(500000) t(i) join grouped_filters on i % 64 = g;
+----
+0	0	0
+
+query I
+select count(*) from duckdb_memory() where tag = 'ALLOCATOR' and memory_usage_bytes > 0;
+----
+0
+
+# Grouped xor and binary fuse builds keep their keys in the aggregate's arena
+# and describe them to DuckDB, so when the groups outgrow memory_limit the hash
+# aggregate spills them to disk instead of failing. (Quotient filter states
+# are fixed-size tables; they count against memory_limit but are not spilled.)
+statement ok
+set memory_limit = '64MB';
+
+statement ok
+create or replace table spilled_filters as
+  select g, xor8_filter(hash(i)) as x, binary_fuse8_filter(hash(i)) as b
+  from range(4000000) t(i), (select i % 1000 as g) group by g;
+
+statement ok
+set memory_limit = '2GB';
+
+query III
+select count(distinct g),
+       count(*) filter (where not xor8_filter_contains(x, hash(i))),
+       count(*) filter (where not binary_fuse8_filter_contains(b, hash(i)))
+from range(4000000) t(i) join spilled_filters on i % 1000 = g;
+----
+1000	0	0

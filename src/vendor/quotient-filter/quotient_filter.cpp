@@ -14,7 +14,9 @@
 #define MAX(a, b)   ((a) > (b) ? (a) : (b))
 #define LOW_MASK(n) ((1ULL << (n)) - 1ULL)
 
-QuotientFilter::QuotientFilter(const QuotientFilter &other) : values(other.values), table(other.table) {
+QuotientFilter::QuotientFilter(const QuotientFilter &other, duckdb::Allocator &allocator) : values(other.values) {
+	allocate_table(allocator);
+	memcpy(owned_table.get(), other.table, owned_table.GetSize());
 }
 
 QuotientFilterValues::QuotientFilterValues(uint32_t q, uint32_t r)
@@ -25,24 +27,46 @@ QuotientFilterValues::QuotientFilterValues(uint32_t q, uint32_t r)
 	assert(q + r <= 64);
 }
 
-QuotientFilter::QuotientFilter(uint32_t q, uint32_t r) : values(q, r), table(QuotientFilter::table_elements(q, r), 0) {
+QuotientFilter::QuotientFilter(uint32_t q, uint32_t r, duckdb::Allocator &allocator) : values(q, r) {
+	allocate_table(allocator);
+	memset(owned_table.get(), 0, owned_table.GetSize());
 }
 
-QuotientFilter::QuotientFilter(const std::string &data) : QuotientFilter(data.data(), data.size()) {
-}
-
-QuotientFilter::QuotientFilter(const char *data, size_t length) {
-	// Validate before copying anything: the header is read straight out of the
-	// buffer and drives every subsequent table index.
+QuotientFilter::QuotientFilter(const char *data, size_t length, duckdb::Allocator &allocator) {
+	// Validate before reading anything else: the header is read straight out
+	// of the buffer and drives every subsequent table index.
 	QuotientFilter::validate_serialized(data, length);
 	memcpy(&values, data, sizeof(QuotientFilterValues));
 
-	// Round the element count up. The last uint64_t is partially used whenever
-	// the table's bit count is not a multiple of 64, and get_elem/set_elem still
-	// address it -- rounding down leaves the filter reading past its own table.
-	size_t table_bytes = QuotientFilter::table_size(values);
-	table.assign(QuotientFilter::table_elements(values), 0);
-	memcpy(table.data(), data + sizeof(QuotientFilterValues), table_bytes);
+	auto table_data = duckdb::const_data_ptr_cast(data + sizeof(QuotientFilterValues));
+	const size_t table_words_bytes = QuotientFilter::table_elements(values) * sizeof(uint64_t);
+	if (length - sizeof(QuotientFilterValues) >= table_words_bytes) {
+		// Every word get_elem can touch is inside the BLOB: read it in place.
+		table = table_data;
+		return;
+	}
+	// The BLOB stores the table rounded to bytes, not words (filters written
+	// before serialize() padded the table), and the last word is partially
+	// used: copy it into a zero-padded table so that word can still be read.
+	allocate_table(allocator);
+	memset(owned_table.get(), 0, owned_table.GetSize());
+	memcpy(owned_table.get(), table_data, QuotientFilter::table_size(values));
+}
+
+void QuotientFilter::allocate_table(duckdb::Allocator &allocator) {
+	owned_table = allocator.Allocate(QuotientFilter::table_elements(values) * sizeof(uint64_t));
+	table = owned_table.get();
+}
+
+inline uint64_t QuotientFilter::load_word(size_t idx) const {
+	return duckdb::Load<uint64_t>(table + idx * sizeof(uint64_t));
+}
+
+inline void QuotientFilter::store_word(size_t idx, uint64_t word) {
+	// Only a filter that owns its table is ever written to; a filter reading a
+	// BLOB in place is a const view of someone else's memory.
+	D_ASSERT(owned_table.get() == table);
+	duckdb::Store<uint64_t>(word, owned_table.get() + idx * sizeof(uint64_t));
 }
 
 /* Return QF[idx] in the lower bits. */
@@ -52,10 +76,10 @@ inline uint64_t QuotientFilter::get_elem(uint64_t idx) const {
 	size_t tabpos = bitpos / 64;
 	size_t slotpos = bitpos % 64;
 	int spillbits = (slotpos + values.elem_bits) - 64;
-	elt = (table[tabpos] >> slotpos) & values.elem_mask;
+	elt = (load_word(tabpos) >> slotpos) & values.elem_mask;
 	if (spillbits > 0) {
 		++tabpos;
-		uint64_t x = table[tabpos] & LOW_MASK(spillbits);
+		uint64_t x = load_word(tabpos) & LOW_MASK(spillbits);
 		elt |= x << (values.elem_bits - spillbits);
 	}
 	return elt;
@@ -68,12 +92,16 @@ void QuotientFilter::set_elem(uint64_t idx, uint64_t elt) {
 	size_t slotpos = bitpos % 64;
 	int spillbits = (slotpos + values.elem_bits) - 64;
 	elt &= values.elem_mask;
-	table[tabpos] &= ~(values.elem_mask << slotpos);
-	table[tabpos] |= elt << slotpos;
+	uint64_t word = load_word(tabpos);
+	word &= ~(values.elem_mask << slotpos);
+	word |= elt << slotpos;
+	store_word(tabpos, word);
 	if (spillbits > 0) {
 		++tabpos;
-		table[tabpos] &= ~LOW_MASK(spillbits);
-		table[tabpos] |= elt >> (values.elem_bits - spillbits);
+		word = load_word(tabpos);
+		word &= ~LOW_MASK(spillbits);
+		word |= elt >> (values.elem_bits - spillbits);
+		store_word(tabpos, word);
 	}
 }
 
@@ -161,12 +189,20 @@ static void QuotientFilterScanStep(uint64_t &steps, uint64_t limit) {
 
 inline uint64_t QuotientFilter::find_run_index(uint64_t fq) const {
 	const uint64_t limit = this->values.max_size;
-	uint64_t steps = 0;
+
+	/*
+	 * Each cursor gets its own budget: in a nearly full table the walk back to
+	 * the cluster start and the walks forward from it can each cover almost
+	 * the whole table, so a single shared budget trips on valid filters.
+	 */
+	uint64_t back_steps = 0;
+	uint64_t s_steps = 0;
+	uint64_t b_steps = 0;
 
 	/* Find the start of the cluster. */
 	uint64_t b = fq;
 	while (is_shifted(this->get_elem(b))) {
-		QuotientFilterScanStep(steps, limit);
+		QuotientFilterScanStep(back_steps, limit);
 		b = decr(b);
 	}
 
@@ -174,12 +210,12 @@ inline uint64_t QuotientFilter::find_run_index(uint64_t fq) const {
 	uint64_t s = b;
 	while (b != fq) {
 		do {
-			QuotientFilterScanStep(steps, limit);
+			QuotientFilterScanStep(s_steps, limit);
 			s = incr(s);
 		} while (is_continuation(this->get_elem(s)));
 
 		do {
-			QuotientFilterScanStep(steps, limit);
+			QuotientFilterScanStep(b_steps, limit);
 			b = incr(b);
 		} while (!is_occupied(this->get_elem(b)));
 	}
@@ -191,8 +227,10 @@ void QuotientFilter::insert_into(uint64_t s, uint64_t elt) {
 	uint64_t prev;
 	uint64_t curr = elt;
 	bool empty;
+	uint64_t steps = 0;
 
 	do {
+		QuotientFilterScanStep(steps, this->values.max_size);
 		prev = this->get_elem(s);
 		empty = is_empty_element(prev);
 		if (!empty) {
@@ -210,8 +248,10 @@ void QuotientFilter::insert_into(uint64_t s, uint64_t elt) {
 }
 
 bool QuotientFilter::insert(uint64_t hash) {
-	if (this->values.entries >= this->values.max_size) {
-		return false;
+	if (this->values.entries >= this->capacity()) {
+		// Full -- unless the hash is already present, in which case inserting
+		// it again is a no-op and succeeds like any other duplicate insert.
+		return this->may_contain(hash);
 	}
 
 	uint64_t fq = this->hash_to_quotient(hash);
@@ -397,29 +437,38 @@ bool QuotientFilter::remove(uint64_t hash) {
 	return true;
 }
 
-QuotientFilter QuotientFilter::merge(const QuotientFilter &other) const {
-	// I don't think we should increase q here, since we are merging two filters
-	// with the same q. If we increase q, we might end up with a filter
-
-	//	uint32_t q = 1 + MAX(this->qbits, other.qbits);
-	uint32_t q = MAX(this->values.qbits, other.values.qbits);
-	uint32_t r = MAX(this->values.rbits, other.values.rbits);
-	QuotientFilter out(q, r);
-
-	QuotientFilterIterator qfi(*this);
-	while (!qfi.done()) {
-		out.insert(qfi.next());
+void QuotientFilter::merge_from(const QuotientFilter &other) {
+	// Each entry of `other` comes back as its low other.q + other.r hash bits.
+	// This filter keys on its own low q + r bits, so it can only rebuild them
+	// if `other` kept at least that many; otherwise the missing high bits
+	// would be stored as zero and lookups of the real hash would miss.
+	const uint32_t needed_bits = this->values.qbits + this->values.rbits;
+	const uint32_t other_bits = other.values.qbits + other.values.rbits;
+	if (other_bits < needed_bits) {
+		throw duckdb::InvalidInputException(
+		    "quotient_filter: cannot merge a filter with q = %u, r = %u into one with q = %u, r = %u: the input keeps "
+		    "%u bits of each hash but the result needs %u. Merge into a filter with q + r <= %u (for example q = %u, "
+		    "r = %u), or rebuild it from the original values.",
+		    (uint32_t)other.values.qbits, (uint32_t)other.values.rbits, (uint32_t)this->values.qbits,
+		    (uint32_t)this->values.rbits, other_bits, needed_bits, other_bits, (uint32_t)this->values.qbits,
+		    other_bits > this->values.qbits ? other_bits - this->values.qbits : 0);
 	}
-	QuotientFilterIterator qfi2(other);
-	while (!qfi2.done()) {
-		out.insert(qfi2.next());
+
+	QuotientFilterIterator it(other);
+	while (!it.done()) {
+		if (!this->insert(it.next())) {
+			throw duckdb::InvalidInputException(
+			    "quotient_filter: the merged filter is full (q = %u holds at most %llu values); increase q to hold "
+			    "more values",
+			    (uint32_t)this->values.qbits, (unsigned long long)this->capacity());
+		}
 	}
-	return out;
 }
 
 void QuotientFilter::clear() {
 	this->values.entries = 0;
-	std::fill(this->table.begin(), this->table.end(), 0);
+	D_ASSERT(owned_table.get() == table);
+	memset(owned_table.get(), 0, owned_table.GetSize());
 }
 
 size_t QuotientFilter::table_size(const QuotientFilterValues &values) {
@@ -432,6 +481,17 @@ size_t QuotientFilter::table_size(uint32_t q, uint32_t r) {
 	uint64_t bits = (1ULL << q) * (uint64_t)(r + 3);
 	uint64_t bytes = bits / 8;
 	return (size_t)((bits % 8) ? (bytes + 1) : bytes);
+}
+
+size_t QuotientFilter::serialized_size(uint32_t q, uint32_t r) {
+	return sizeof(QuotientFilterValues) + QuotientFilter::table_elements(q, r) * sizeof(uint64_t);
+}
+
+void QuotientFilter::serialize_into(char *out) const {
+	memcpy(out, &values, sizeof(QuotientFilterValues));
+	// Write the table as whole words, padding included, so that reading the
+	// BLOB back can use it in place (see the deserializing constructor).
+	memcpy(out + sizeof(QuotientFilterValues), table, QuotientFilter::table_elements(values) * sizeof(uint64_t));
 }
 
 size_t QuotientFilter::table_elements(const QuotientFilterValues &values) {
