@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/function.hpp"
+#include "duckdb/function/scalar_function.hpp"
 
 namespace duckdb {
 
@@ -162,6 +163,33 @@ public:
 	virtual void Describe(BitfilterInfo &info) const = 0;
 };
 
+#if defined(__GNUC__) || defined(__clang__)
+#define BITFILTERS_PREFETCH(address) __builtin_prefetch(address)
+#else
+#define BITFILTERS_PREFETCH(address) ((void)(address))
+#endif
+
+//! A batch probe for filters whose lookups touch memory at positions computed
+//! from the key. Large filters do not fit in the CPU caches, so each lookup
+//! waits on memory; locating a group of keys and prefetching their positions
+//! before checking any of them overlaps those waits. DERIVED provides
+//!   LOCATION Locate(uint64_t key) const      -- computes positions, prefetches
+//!   bool Check(const LOCATION &location) const
+template <class DERIVED, class LOCATION>
+void BitfiltersPrefetchingBatch(const DERIVED &probe, const uint64_t *keys, idx_t count, bool *result) {
+	constexpr idx_t GROUP = 16;
+	LOCATION locations[GROUP];
+	for (idx_t start = 0; start < count; start += GROUP) {
+		const auto group = MinValue<idx_t>(GROUP, count - start);
+		for (idx_t i = 0; i < group; i++) {
+			locations[i] = probe.Locate(keys[start + i]);
+		}
+		for (idx_t i = 0; i < group; i++) {
+			result[start + i] = probe.Check(locations[i]);
+		}
+	}
+}
+
 //! Implements ContainsBatch with a loop the compiler can inline.
 template <class DERIVED>
 class BitfilterProbeBase : public BitfilterProbe {
@@ -192,9 +220,9 @@ unique_ptr<BitfilterProbe> BinaryFuseFilterOpen(BitfilterType type, const_data_p
                                                 const char *function);
 unique_ptr<BitfilterProbe> BloomFilterOpen(const_data_ptr_t payload, idx_t size, const char *function);
 
-//! The body of every <type>_contains function, and of bitfilter_contains when
-//! `type` is not given: args are (filter BLOB, value ANY).
-void BitfiltersContains(DataChunk &args, ExpressionState &state, Vector &result, optional_ptr<const BitfilterType> type,
-                        const char *function);
+//! The scalar function <type>_contains(filter BLOB, value ANY) for `type`, or
+//! bitfilter_contains(filter BLOB, value ANY) for any filter with a header
+//! when `type` is not given.
+ScalarFunction BitfiltersContainsFunction(optional_ptr<const BitfilterType> type);
 
 } // namespace duckdb

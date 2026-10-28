@@ -320,11 +320,6 @@ private:
 	QuotientFilter filter;
 };
 
-void QuotientFilterContains(DataChunk &args, ExpressionState &state, Vector &result) {
-	static const BitfilterType type = BitfilterType::QUOTIENT;
-	BitfiltersContains(args, state, result, &type, "quotient_filter_contains");
-}
-
 } // namespace
 
 unique_ptr<BitfilterProbe> QuotientFilterOpen(const_data_ptr_t payload, idx_t size, Allocator &allocator,
@@ -400,8 +395,8 @@ void LoadQuotientFilter(ExtensionLoader &loader) {
 
 	{
 		ScalarFunctionSet fs("quotient_filter_contains");
-		fs.AddFunction(
-		    ScalarFunction({LogicalType::BLOB, LogicalType::ANY}, LogicalType::BOOLEAN, QuotientFilterContains));
+		const auto type = BitfilterType::QUOTIENT;
+		fs.AddFunction(BitfiltersContainsFunction(&type));
 		fs.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fs));
 		{

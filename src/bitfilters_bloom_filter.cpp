@@ -320,6 +320,35 @@ public:
 		return BloomCheck(bits, num_blocks, key);
 	}
 
+	// A key's block (one 32 byte read) and the half of the key that picks
+	// its bits in that block.
+	struct Location {
+		const_data_ptr_t block;
+		uint32_t x;
+	};
+
+	Location Locate(uint64_t key) const {
+		Location location {BloomBlock(bits, num_blocks, key), static_cast<uint32_t>(key)};
+		// BLOBs carry no alignment guarantee, so a block can straddle two
+		// cache lines.
+		BITFILTERS_PREFETCH(location.block);
+		BITFILTERS_PREFETCH(location.block + BLOOM_BLOCK_BYTES - 1);
+		return location;
+	}
+
+	bool Check(const Location &location) const {
+		bool result = true;
+		for (idx_t i = 0; i < BLOOM_WORDS; i++) {
+			const auto word = Load<uint32_t>(location.block + i * sizeof(uint32_t));
+			result &= ((word >> ((location.x * BLOOM_SALT[i]) >> 27)) & 1) != 0;
+		}
+		return result;
+	}
+
+	void ContainsBatch(const uint64_t *keys, idx_t count, bool *result) const override {
+		BitfiltersPrefetchingBatch<BloomProbe, Location>(*this, keys, count, result);
+	}
+
 	void Describe(BitfilterInfo &info) const override {
 		// A random key hits a random block and has to find its bit set in all
 		// eight words: the expected false positive rate is the mean over the
@@ -352,11 +381,6 @@ private:
 	idx_t size;
 	uint64_t num_blocks;
 };
-
-void BloomFilterContains(DataChunk &args, ExpressionState &state, Vector &result) {
-	static const BitfilterType type = BitfilterType::BLOOM;
-	BitfiltersContains(args, state, result, &type, "bloom_filter_contains");
-}
 
 } // namespace
 
@@ -411,8 +435,8 @@ void LoadBloomFilter(ExtensionLoader &loader) {
 	}
 	{
 		ScalarFunctionSet fs("bloom_filter_contains");
-		fs.AddFunction(
-		    ScalarFunction({LogicalType::BLOB, LogicalType::ANY}, LogicalType::BOOLEAN, BloomFilterContains));
+		const auto type = BitfilterType::BLOOM;
+		fs.AddFunction(BitfiltersContainsFunction(&type));
 		fs.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fs));
 		FunctionDescription desc;

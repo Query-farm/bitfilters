@@ -215,6 +215,27 @@ struct BitfiltersKeyCollectOperation {
 		}
 	}
 
+	// Whether `keys` looks like it repeats values a lot, judged from a sample
+	// of evenly spaced keys. Keys are hashes, so distinct values almost never
+	// collide and any repeats in the sample mean repeated input values.
+	static bool LooksRepetitive(const uint64_t *keys, idx_t count) {
+		constexpr idx_t SAMPLE = 4096;
+		if (count < 2 * SAMPLE) {
+			return false;
+		}
+		uint64_t sample[SAMPLE];
+		const auto stride = count / SAMPLE;
+		for (idx_t i = 0; i < SAMPLE; i++) {
+			sample[i] = keys[i * stride];
+		}
+		std::sort(sample, sample + SAMPLE);
+		idx_t repeats = 0;
+		for (idx_t i = 1; i < SAMPLE; i++) {
+			repeats += sample[i] == sample[i - 1];
+		}
+		return repeats > SAMPLE / 100;
+	}
+
 	// Sorts `keys` and drops repeats; returns how many distinct keys remain.
 	static idx_t SortUnique(uint64_t *keys, idx_t count) {
 		std::sort(keys, keys + count);

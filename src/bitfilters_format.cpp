@@ -3,9 +3,17 @@
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/vector/vector_iterator.hpp"
 #include "duckdb/common/vector/vector_writer.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
 
@@ -302,6 +310,29 @@ void BitfiltersComputeKeys(const BitfilterKeyFormat &format, Vector &input, Vect
 		WriteKeys<uint64_t>(input, keys, count, [](uint64_t value) { return value; });
 		break;
 	case BitfilterHash::XXH64:
+		if (input.GetVectorType() == VectorType::DICTIONARY_VECTOR) {
+			// Strings read from Parquet and other dictionary-encoded sources
+			// repeat a few distinct values many times: hash each dictionary
+			// entry once rather than every row.
+			const auto dictionary_size = DictionaryVector::DictionarySize(input);
+			if (dictionary_size.IsValid() && dictionary_size.GetIndex() < count) {
+				const auto size = dictionary_size.GetIndex();
+				Vector dictionary_keys(LogicalType::UBIGINT, size);
+				ComputeXXH64Keys(DictionaryVector::Child(input), dictionary_keys, size);
+				auto entries = dictionary_keys.Values<uint64_t>();
+				auto &sel = DictionaryVector::SelVector(input);
+				auto writer = FlatVector::Writer<uint64_t>(keys, count);
+				for (idx_t i = 0; i < count; i++) {
+					auto entry = entries[sel.get_index(i)];
+					if (!entry.IsValid()) {
+						writer.WriteNull();
+					} else {
+						writer.WriteValue(entry.GetValue());
+					}
+				}
+				break;
+			}
+		}
 		ComputeXXH64Keys(input, keys, count);
 		break;
 	}
@@ -424,30 +455,169 @@ unique_ptr<BitfilterProbe> BitfiltersOpen(BitfilterType type, const_data_ptr_t p
 	throw InternalException("unknown bitfilter type");
 }
 
-void BitfiltersContains(DataChunk &args, ExpressionState &state, Vector &result, optional_ptr<const BitfilterType> type,
-                        const char *function) {
+namespace {
+
+const char *ContainsFunctionName(optional_ptr<const BitfilterType> type) {
+	if (!type) {
+		return "bitfilter_contains";
+	}
+	switch (*type) {
+	case BitfilterType::QUOTIENT:
+		return "quotient_filter_contains";
+	case BitfilterType::XOR8:
+		return "xor8_filter_contains";
+	case BitfilterType::XOR16:
+		return "xor16_filter_contains";
+	case BitfilterType::BINARY_FUSE8:
+		return "binary_fuse8_filter_contains";
+	case BitfilterType::BINARY_FUSE16:
+		return "binary_fuse16_filter_contains";
+	case BitfilterType::BLOOM:
+		return "bloom_filter_contains";
+	}
+	throw InternalException("unknown bitfilter type");
+}
+
+// Opens `blob`, as a filter of `type` if given; without a type the BLOB must
+// say what it is in its header.
+unique_ptr<BitfilterProbe> OpenFilter(const string_t &blob, optional_ptr<const BitfilterType> type,
+                                      Allocator &allocator, const char *function, BitfilterKeyFormat &keys) {
+	auto parsed = type ? BitfilterBlob::Expect(blob, *type, function) : BitfilterBlob::Parse(blob, function);
+	if (!parsed.has_header && !type) {
+		throw InvalidInputException("%s: the filter BLOB has no bitfilters header (it was written by an older "
+		                            "version); probe it with the function for its filter type, e.g. "
+		                            "xor8_filter_contains",
+		                            function);
+	}
+	keys = parsed.keys;
+	return BitfiltersOpen(parsed.type, parsed.payload, parsed.payload_size, allocator, function);
+}
+
+// Bind data of a _contains function whose filter argument is a constant (a
+// literal, a variable, anything foldable). DuckDB materializes a constant BLOB
+// into every chunk it evaluates, so a multi-megabyte filter used to be copied
+// for every 2048 rows probed -- far more work than the probes. The filter is
+// kept here instead, and the argument replaced by an empty placeholder.
+struct ConstantFilterData : public FunctionData {
+	ConstantFilterData() = default;
+	explicit ConstantFilterData(string filter_p) : filter(std::move(filter_p)), has_filter(true) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ConstantFilterData>();
+		result->filter = filter;
+		result->has_filter = has_filter;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ConstantFilterData>();
+		return has_filter == other.has_filter && filter == other.filter;
+	}
+
+	static void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+	                      const BoundScalarFunction &) {
+		auto &data = bind_data->Cast<ConstantFilterData>();
+		serializer.WriteProperty(100, "filter",
+		                         data.has_filter
+		                             ? Value::BLOB(const_data_ptr_cast(data.filter.data()), data.filter.size())
+		                             : Value(LogicalType::BLOB));
+	}
+
+	static unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundScalarFunction &) {
+		auto filter = deserializer.ReadProperty<Value>(100, "filter");
+		if (filter.IsNull()) {
+			return make_uniq<ConstantFilterData>();
+		}
+		return make_uniq<ConstantFilterData>(StringValue::Get(filter));
+	}
+
+	string filter;
+	bool has_filter = false;
+};
+
+// The filter a thread probes when it is a constant, opened once.
+struct ConstantFilterState : public FunctionLocalState {
+	unique_ptr<BitfilterProbe> probe;
+	BitfilterKeyFormat keys;
+};
+
+template <uint8_t TYPE_ID>
+struct ContainsFunction {
+	static optional_ptr<const BitfilterType> Type() {
+		static const auto type = static_cast<BitfilterType>(TYPE_ID);
+		return TYPE_ID == 0 ? nullptr : &type;
+	}
+
+	static unique_ptr<FunctionData> Bind(BindScalarFunctionInput &input) {
+		auto &arguments = input.GetArguments();
+		auto &filter = *arguments[0];
+		if (filter.HasParameter() || !filter.IsFoldable()) {
+			return make_uniq<ConstantFilterData>();
+		}
+		auto &context = input.GetClientContext();
+		auto value = ExpressionExecutor::EvaluateScalar(context, filter);
+		if (value.IsNull()) {
+			return make_uniq<ConstantFilterData>();
+		}
+		auto data = make_uniq<ConstantFilterData>(StringValue::Get(value));
+		// Validate now, so a bad constant filter fails before execution.
+		BitfilterKeyFormat keys;
+		OpenFilter(string_t(data->filter), Type(), BufferAllocator::Get(context), ContainsFunctionName(Type()), keys);
+		arguments[0] = make_uniq<BoundConstantExpression>(Value::BLOB(string()));
+		return std::move(data);
+	}
+
+	static unique_ptr<FunctionLocalState> InitLocalState(ExpressionState &state, const BoundFunctionExpression &,
+	                                                     FunctionData *bind_data) {
+		auto &data = bind_data->Cast<ConstantFilterData>();
+		if (!data.has_filter) {
+			return nullptr;
+		}
+		auto result = make_uniq<ConstantFilterState>();
+		result->probe = OpenFilter(string_t(data.filter), Type(), BufferAllocator::Get(state.GetContext()),
+		                           ContainsFunctionName(Type()), result->keys);
+		return std::move(result);
+	}
+
+	static void Execute(DataChunk &args, ExpressionState &state, Vector &result);
+};
+
+// Writes the probe results for the rows of `values`: NULL for NULL values,
+// false for values that cannot be cast to the filter's type.
+void WriteResults(BitfilterProbe &probe, const BitfiltersProbeKeys::Keys &keys, Vector &values, Vector &result,
+                  idx_t count) {
+	auto value_validity = values.Validity();
+	auto writer = FlatVector::Writer<bool>(result, count);
+	auto found = make_unsafe_uniq_array<bool>(count);
+	probe.ContainsBatch(FlatVector::GetData<uint64_t>(*keys.keys), count, found.get());
+	for (idx_t i = 0; i < count; i++) {
+		if (!value_validity.IsValid(i)) {
+			writer.WriteNull();
+		} else {
+			writer.WriteValue(found[i] && keys.castable.RowIsValid(i));
+		}
+	}
+}
+
+template <uint8_t TYPE_ID>
+void ContainsFunction<TYPE_ID>::Execute(DataChunk &args, ExpressionState &state, Vector &result) {
 	D_ASSERT(args.ColumnCount() == 2);
+	auto type = Type();
+	const auto function = ContainsFunctionName(type);
 	auto &filters = args.data[0];
 	auto &values = args.data[1];
 	const auto count = args.size();
-	auto &allocator = BufferAllocator::Get(state.GetContext());
 	BitfiltersProbeKeys probe_keys(values, count, function);
 
-	auto open = [&](const string_t &blob, BitfilterKeyFormat &keys) {
-		auto parsed = type ? BitfilterBlob::Expect(blob, *type, function) : BitfilterBlob::Parse(blob, function);
-		if (!parsed.has_header && !type) {
-			throw InvalidInputException("%s: the filter BLOB has no bitfilters header (it was written by an older "
-			                            "version); probe it with the function for its filter type, e.g. "
-			                            "xor8_filter_contains",
-			                            function);
-		}
-		keys = parsed.keys;
-		return BitfiltersOpen(parsed.type, parsed.payload, parsed.payload_size, allocator, function);
-	};
+	auto local_state = ExecuteFunctionState::GetFunctionState(state);
+	if (local_state) {
+		auto &constant = local_state->Cast<ConstantFilterState>();
+		WriteResults(*constant.probe, probe_keys.Get(constant.keys), values, result, count);
+		return;
+	}
 
-	auto value_validity = values.Validity();
-	auto writer = FlatVector::Writer<bool>(result, count);
-
+	auto &allocator = BufferAllocator::Get(state.GetContext());
 	auto filter_values = filters.Values<string_t>();
 	if (filters.GetVectorType() == VectorType::CONSTANT_VECTOR) {
 		if (count == 0) {
@@ -455,53 +625,112 @@ void BitfiltersContains(DataChunk &args, ExpressionState &state, Vector &result,
 		}
 		auto filter = filter_values[0];
 		if (!filter.IsValid()) {
+			auto writer = FlatVector::Writer<bool>(result, count);
 			for (idx_t i = 0; i < count; i++) {
 				writer.WriteNull();
 			}
 			return;
 		}
 		BitfilterKeyFormat format;
-		auto probe = open(filter.GetValue(), format);
-		auto &keys = probe_keys.Get(format);
-		auto found = make_unsafe_uniq_array<bool>(count);
-		probe->ContainsBatch(FlatVector::GetData<uint64_t>(*keys.keys), count, found.get());
-		for (idx_t i = 0; i < count; i++) {
-			if (!value_validity.IsValid(i)) {
-				writer.WriteNull();
-			} else {
-				writer.WriteValue(found[i] && keys.castable.RowIsValid(i));
-			}
-		}
+		auto probe = OpenFilter(filter.GetValue(), type, allocator, function, format);
+		WriteResults(*probe, probe_keys.Get(format), values, result, count);
 		return;
 	}
 
-	// Per-row filters. The same filter is usually repeated across many rows
-	// (a join against a table of filters), so keep the last one opened. Only
-	// opened (validated) BLOBs are cached; they are longer than the inline
-	// threshold, so their data pointers are stable heap addresses.
-	unique_ptr<BitfilterProbe> cached;
-	BitfilterKeyFormat cached_format;
-	const char *cached_data = nullptr;
-	uint32_t cached_size = 0;
+	// Per-row filters, as from a join against a table of filters: rows usually
+	// cycle through a handful of filters. Open each distinct filter once per
+	// chunk, then probe each filter's rows as one batch, so the probes get the
+	// same prefetching as a constant filter.
+	struct FilterRows {
+		unique_ptr<BitfilterProbe> probe;
+		BitfilterKeyFormat format;
+		uint32_t size = 0;
+		vector<sel_t> rows;
+	};
+	vector<FilterRows> opened;
+	// Keyed by the BLOB's data pointer and size. Only opened (validated) BLOBs
+	// are entered; they are longer than the inline threshold, so their data
+	// pointers are stable heap addresses.
+	unordered_map<const char *, idx_t> opened_index;
+	auto value_validity = values.Validity();
+	auto is_null = make_unsafe_uniq_array<bool>(count);
 	for (idx_t i = 0; i < count; i++) {
 		auto filter = filter_values[i];
-		if (!filter.IsValid() || !value_validity.IsValid(i)) {
-			writer.WriteNull();
+		is_null[i] = !filter.IsValid() || !value_validity.IsValid(i);
+		if (is_null[i]) {
 			continue;
 		}
 		auto blob = filter.GetValue();
-		if (!cached || blob.GetData() != cached_data || blob.GetSize() != cached_size) {
-			cached = open(blob, cached_format);
-			cached_data = blob.GetData();
-			cached_size = blob.GetSize();
+		auto entry = opened_index.find(blob.GetData());
+		if (entry == opened_index.end() || opened[entry->second].size != blob.GetSize()) {
+			FilterRows filter_rows;
+			filter_rows.probe = OpenFilter(blob, type, allocator, function, filter_rows.format);
+			filter_rows.size = blob.GetSize();
+			entry = opened_index.insert_or_assign(blob.GetData(), opened.size()).first;
+			opened.push_back(std::move(filter_rows));
 		}
-		auto &keys = probe_keys.Get(cached_format);
-		if (!keys.castable.RowIsValid(i)) {
-			writer.WriteValue(false);
-			continue;
-		}
-		writer.WriteValue(cached->Contains(FlatVector::GetData<uint64_t>(*keys.keys)[i]));
+		opened[entry->second].rows.push_back(UnsafeNumericCast<sel_t>(i));
 	}
+
+	auto found = make_unsafe_uniq_array<bool>(count);
+	auto batch_keys = make_unsafe_uniq_array<uint64_t>(count);
+	auto batch_found = make_unsafe_uniq_array<bool>(count);
+	for (auto &filter_rows : opened) {
+		auto &keys = probe_keys.Get(filter_rows.format);
+		auto key_data = FlatVector::GetData<uint64_t>(*keys.keys);
+		const auto row_count = filter_rows.rows.size();
+		for (idx_t r = 0; r < row_count; r++) {
+			batch_keys[r] = key_data[filter_rows.rows[r]];
+		}
+		filter_rows.probe->ContainsBatch(batch_keys.get(), row_count, batch_found.get());
+		for (idx_t r = 0; r < row_count; r++) {
+			const auto row = filter_rows.rows[r];
+			found[row] = batch_found[r] && keys.castable.RowIsValid(row);
+		}
+	}
+
+	auto writer = FlatVector::Writer<bool>(result, count);
+	for (idx_t i = 0; i < count; i++) {
+		if (is_null[i]) {
+			writer.WriteNull();
+		} else {
+			writer.WriteValue(found[i]);
+		}
+	}
+}
+
+template <uint8_t TYPE_ID>
+ScalarFunction MakeContainsFunction() {
+	using OP = ContainsFunction<TYPE_ID>;
+	ScalarFunction function({LogicalType::BLOB, LogicalType::ANY}, LogicalType::BOOLEAN, OP::Execute);
+	function.SetBindCallback(OP::Bind);
+	function.SetInitStateCallback(OP::InitLocalState);
+	function.SetSerializeCallback(ConstantFilterData::Serialize);
+	function.SetDeserializeCallback(ConstantFilterData::Deserialize);
+	return function;
+}
+
+} // namespace
+
+ScalarFunction BitfiltersContainsFunction(optional_ptr<const BitfilterType> type) {
+	if (!type) {
+		return MakeContainsFunction<0>();
+	}
+	switch (*type) {
+	case BitfilterType::QUOTIENT:
+		return MakeContainsFunction<static_cast<uint8_t>(BitfilterType::QUOTIENT)>();
+	case BitfilterType::XOR8:
+		return MakeContainsFunction<static_cast<uint8_t>(BitfilterType::XOR8)>();
+	case BitfilterType::XOR16:
+		return MakeContainsFunction<static_cast<uint8_t>(BitfilterType::XOR16)>();
+	case BitfilterType::BINARY_FUSE8:
+		return MakeContainsFunction<static_cast<uint8_t>(BitfilterType::BINARY_FUSE8)>();
+	case BitfilterType::BINARY_FUSE16:
+		return MakeContainsFunction<static_cast<uint8_t>(BitfilterType::BINARY_FUSE16)>();
+	case BitfilterType::BLOOM:
+		return MakeContainsFunction<static_cast<uint8_t>(BitfilterType::BLOOM)>();
+	}
+	throw InternalException("unknown bitfilter type");
 }
 
 } // namespace duckdb

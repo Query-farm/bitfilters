@@ -71,6 +71,9 @@ struct XorTraits<xor8_t> {
 	static bool Contains(uint64_t item, const xor8_t *filter) {
 		return xor8_contain(item, filter);
 	}
+	static uint8_t Load(const uint8_t *fingerprints, uint32_t index) {
+		return fingerprints[index];
+	}
 	static void SetFingerprints(xor8_t *filter, const char *data) {
 		filter->fingerprints = reinterpret_cast<uint8_t *>(const_cast<char *>(data));
 	}
@@ -114,6 +117,9 @@ struct XorTraits<xor16_t> {
 		uint32_t h2 = xor_reduce(r2, block_length) + 2 * block_length;
 		return f == (uint16_t)(LoadUnaligned16(filter->fingerprints, h0) ^ LoadUnaligned16(filter->fingerprints, h1) ^
 		                       LoadUnaligned16(filter->fingerprints, h2));
+	}
+	static uint16_t Load(const uint16_t *fingerprints, uint32_t index) {
+		return LoadUnaligned16(fingerprints, index);
 	}
 	static void SetFingerprints(xor16_t *filter, const char *data) {
 		filter->fingerprints = reinterpret_cast<uint16_t *>(const_cast<char *>(data));
@@ -217,6 +223,12 @@ struct XorFilterCreateOperation : BitfiltersKeyCollectOperation {
 		// The construction may reorder and de-duplicate the keys in place, so
 		// it works on a copy and the state stays intact.
 		auto key_array = GatherKeys(keys, allocation_scope.GetAllocator());
+		// The construction struggles with many repeated keys -- it makes
+		// several full passes before it notices -- so drop repeats up front
+		// when a sample shows plenty of them.
+		if (LooksRepetitive(reinterpret_cast<uint64_t *>(key_array.get()), count)) {
+			count = static_cast<uint32_t>(SortUnique(reinterpret_cast<uint64_t *>(key_array.get()), count));
+		}
 
 		FilterType filter;
 		if (!Traits::Allocate(count, &filter)) {
@@ -288,6 +300,40 @@ public:
 		return Traits::Contains(key, &filter);
 	}
 
+	// The three fingerprint positions of a key and the fingerprint they must
+	// XOR to, as xor{8,16}_contain computes them.
+	struct Location {
+		uint32_t h0;
+		uint32_t h1;
+		uint32_t h2;
+		typename Traits::FingerprintType fingerprint;
+	};
+
+	Location Locate(uint64_t key) const {
+		const uint64_t hash = xor_mix_split(key, filter.seed);
+		const auto block_length = static_cast<uint32_t>(filter.blockLength);
+		Location location;
+		location.fingerprint = static_cast<typename Traits::FingerprintType>(xor_fingerprint(hash));
+		location.h0 = xor_reduce(static_cast<uint32_t>(hash), block_length);
+		location.h1 = xor_reduce(static_cast<uint32_t>(xor_rotl64(hash, 21)), block_length) + block_length;
+		location.h2 = xor_reduce(static_cast<uint32_t>(xor_rotl64(hash, 42)), block_length) + 2 * block_length;
+		BITFILTERS_PREFETCH(filter.fingerprints + location.h0);
+		BITFILTERS_PREFETCH(filter.fingerprints + location.h1);
+		BITFILTERS_PREFETCH(filter.fingerprints + location.h2);
+		return location;
+	}
+
+	bool Check(const Location &location) const {
+		return location.fingerprint ==
+		       static_cast<typename Traits::FingerprintType>(Traits::Load(filter.fingerprints, location.h0) ^
+		                                                     Traits::Load(filter.fingerprints, location.h1) ^
+		                                                     Traits::Load(filter.fingerprints, location.h2));
+	}
+
+	void ContainsBatch(const uint64_t *keys, idx_t count, bool *result) const override {
+		BitfiltersPrefetchingBatch<XorProbe, Location>(*this, keys, count, result);
+	}
+
 	void Describe(BitfilterInfo &info) const override {
 		info.fingerprint_bits = sizeof(typename Traits::FingerprintType) * 8;
 		info.expected_fpr = std::ldexp(1.0, -static_cast<int>(info.fingerprint_bits));
@@ -304,15 +350,9 @@ static void RegisterXorFilterFunctionsForType(AggregateFunctionSet &Xorfilter, c
 }
 
 template <BitfilterType TYPE>
-static void XorFilterContains(DataChunk &args, ExpressionState &state, Vector &result) {
-	static const BitfilterType type = TYPE;
-	BitfiltersContains(args, state, result, &type,
-	                   TYPE == BitfilterType::XOR8 ? "xor8_filter_contains" : "xor16_filter_contains");
-}
-
-template <BitfilterType TYPE>
-static void RegisterXorFilterContainsForType(ScalarFunctionSet &fs, const LogicalType &type) {
-	fs.AddFunction(ScalarFunction({LogicalType::BLOB, type}, LogicalType::BOOLEAN, XorFilterContains<TYPE>));
+static void RegisterXorFilterContainsForType(ScalarFunctionSet &fs, const LogicalType &) {
+	const auto type = TYPE;
+	fs.AddFunction(BitfiltersContainsFunction(&type));
 }
 } // namespace
 

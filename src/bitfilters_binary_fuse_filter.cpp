@@ -72,6 +72,15 @@ struct BinaryFuseTraits<binary_fuse8_t> {
 	static bool Contains(uint64_t item, const binary_fuse8_t *filter) {
 		return binary_fuse8_contain(item, filter);
 	}
+	static uint8_t Fingerprint(uint64_t hash) {
+		return binary_fuse8_fingerprint(hash);
+	}
+	static binary_hashes_t Positions(uint64_t hash, const binary_fuse8_t *filter) {
+		return binary_fuse8_hash_batch(hash, filter);
+	}
+	static uint8_t Load(const uint8_t *fingerprints, uint32_t index) {
+		return fingerprints[index];
+	}
 	static void SetFingerprints(binary_fuse8_t *filter, const char *data) {
 		filter->Fingerprints = reinterpret_cast<uint8_t *>(const_cast<char *>(data));
 	}
@@ -110,6 +119,15 @@ struct BinaryFuseTraits<binary_fuse16_t> {
 		f ^= LoadUnaligned16(filter->Fingerprints, hashes.h0) ^ LoadUnaligned16(filter->Fingerprints, hashes.h1) ^
 		     LoadUnaligned16(filter->Fingerprints, hashes.h2);
 		return f == 0;
+	}
+	static uint16_t Fingerprint(uint64_t hash) {
+		return binary_fuse16_fingerprint(hash);
+	}
+	static binary_hashes_t Positions(uint64_t hash, const binary_fuse16_t *filter) {
+		return binary_fuse16_hash_batch(hash, filter);
+	}
+	static uint16_t Load(const uint16_t *fingerprints, uint32_t index) {
+		return LoadUnaligned16(fingerprints, index);
 	}
 	static void SetFingerprints(binary_fuse16_t *filter, const char *data) {
 		filter->Fingerprints = reinterpret_cast<uint16_t *>(const_cast<char *>(data));
@@ -256,6 +274,12 @@ struct BinaryFuseFilterCreateOperation : BitfiltersKeyCollectOperation {
 		// The construction may reorder and de-duplicate the keys in place, so
 		// it works on a copy and the state stays intact.
 		auto key_array = GatherKeys(keys, allocation_scope.GetAllocator());
+		// The construction struggles with many repeated keys -- it makes
+		// several full passes before it notices -- so drop repeats up front
+		// when a sample shows plenty of them.
+		if (LooksRepetitive(reinterpret_cast<uint64_t *>(key_array.get()), count)) {
+			count = static_cast<uint32_t>(SortUnique(reinterpret_cast<uint64_t *>(key_array.get()), count));
+		}
 
 		FilterType filter;
 		if (!Traits::Allocate(count, &filter)) {
@@ -330,6 +354,35 @@ public:
 		return Traits::Contains(key, &filter);
 	}
 
+	// The three fingerprint positions of a key and the fingerprint they must
+	// XOR to, as binary_fuse{8,16}_contain computes them.
+	struct Location {
+		binary_hashes_t positions;
+		typename Traits::FingerprintType fingerprint;
+	};
+
+	Location Locate(uint64_t key) const {
+		const uint64_t hash = binary_fuse_mix_split(key, filter.Seed);
+		Location location;
+		location.fingerprint = Traits::Fingerprint(hash);
+		location.positions = Traits::Positions(hash, &filter);
+		BITFILTERS_PREFETCH(filter.Fingerprints + location.positions.h0);
+		BITFILTERS_PREFETCH(filter.Fingerprints + location.positions.h1);
+		BITFILTERS_PREFETCH(filter.Fingerprints + location.positions.h2);
+		return location;
+	}
+
+	bool Check(const Location &location) const {
+		return location.fingerprint ==
+		       static_cast<typename Traits::FingerprintType>(Traits::Load(filter.Fingerprints, location.positions.h0) ^
+		                                                     Traits::Load(filter.Fingerprints, location.positions.h1) ^
+		                                                     Traits::Load(filter.Fingerprints, location.positions.h2));
+	}
+
+	void ContainsBatch(const uint64_t *keys, idx_t count, bool *result) const override {
+		BitfiltersPrefetchingBatch<BinaryFuseProbe, Location>(*this, keys, count, result);
+	}
+
 	void Describe(BitfilterInfo &info) const override {
 		// Size counts every value the filter was built from, repeats included.
 		info.entries = filter.Size;
@@ -348,16 +401,9 @@ static void RegisterBinaryFuseFilterFunctionsForType(AggregateFunctionSet &Binar
 }
 
 template <BitfilterType TYPE>
-static void BinaryFuseFilterContains(DataChunk &args, ExpressionState &state, Vector &result) {
-	static const BitfilterType type = TYPE;
-	BitfiltersContains(args, state, result, &type,
-	                   TYPE == BitfilterType::BINARY_FUSE8 ? "binary_fuse8_filter_contains"
-	                                                       : "binary_fuse16_filter_contains");
-}
-
-template <BitfilterType TYPE>
-static void RegisterBinaryFuseFilterContainsForType(ScalarFunctionSet &fs, const LogicalType &type) {
-	fs.AddFunction(ScalarFunction({LogicalType::BLOB, type}, LogicalType::BOOLEAN, BinaryFuseFilterContains<TYPE>));
+static void RegisterBinaryFuseFilterContainsForType(ScalarFunctionSet &fs, const LogicalType &) {
+	const auto type = TYPE;
+	fs.AddFunction(BitfiltersContainsFunction(&type));
 }
 } // namespace
 

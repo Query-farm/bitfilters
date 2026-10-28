@@ -99,10 +99,6 @@ void IsValidFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 }
 
-void GenericContainsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	BitfiltersContains(args, state, result, nullptr, "bitfilter_contains");
-}
-
 FunctionDescription Describe(const string &text, vector<string> names, vector<LogicalType> types, string example) {
 	FunctionDescription desc;
 	desc.description = text;
@@ -160,8 +156,7 @@ void LoadBitfiltersInspect(ExtensionLoader &loader) {
 	RegisterTypeFunctions<BitfilterType::BINARY_FUSE16>(loader);
 	RegisterTypeFunctions<BitfilterType::BLOOM>(loader);
 
-	RegisterScalar(loader, "bitfilter_contains",
-	               ScalarFunction({LogicalType::BLOB, LogicalType::ANY}, LogicalType::BOOLEAN, GenericContainsFunction),
+	RegisterScalar(loader, "bitfilter_contains", BitfiltersContainsFunction(nullptr),
 	               Describe("Tests if any bitfilters filter may contain a value; the filter's header says what kind "
 	                        "of filter it is and how its values were hashed. Returns true if the value might be in "
 	                        "the set, or false if it is definitely not.",

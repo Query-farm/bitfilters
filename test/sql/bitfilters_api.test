@@ -322,3 +322,68 @@ from range(300000) t(i) join (select i % 10 as g, quotient_filter(10, i) as f fr
 
 statement ok
 reset threads;
+
+# ---------------------------------------------------------------------------
+# A constant filter (a literal, a variable, anything foldable) is read once
+# when the query is bound instead of being copied into every chunk probed
+# ---------------------------------------------------------------------------
+
+statement ok
+set variable big_filter = (select xor8_filter(i) from range(100000) t(i));
+
+query II
+select count(*) filter (where xor8_filter_contains(getvariable('big_filter'), i)),
+       count(*) filter (where bitfilter_contains(getvariable('big_filter'), i))
+from range(100000) t(i);
+----
+100000	100000
+
+# both arguments constant: folded into a constant result
+query I
+select xor8_filter_contains(getvariable('big_filter'), 42);
+----
+true
+
+# an invalid constant filter fails when the query is bound
+statement error
+select xor8_filter_contains('not a filter'::BLOB, i) from range(10) t(i);
+----
+is not a valid xor8 filter BLOB
+
+query I
+select xor8_filter_contains(NULL::BLOB, i) from range(1) t(i);
+----
+NULL
+
+# prepared parameters are not constant at bind time, and still work
+statement ok
+prepare probe as select count(*) filter (where xor8_filter_contains($1, i)) from range(100000) t(i);
+
+query I
+execute probe(getvariable('big_filter'));
+----
+100000
+
+# and so do filters that come from a subquery
+query I
+select count(*) filter (where quotient_filter_contains((select quotient_filter(8, i) from range(1000) t(i)), i))
+from range(1000) t(i);
+----
+1000
+
+# rows that interleave several filters within a chunk, with NULL values among
+# them: each row is probed against its own filter
+query II
+select count(*) filter (where xor8_filter_contains(f, v)), count(*) filter (where xor8_filter_contains(f, v) is null)
+from (select i, case when i % 10 = 0 then null else i end as v from range(10000) t(i)) r
+join (select i % 7 as g, xor8_filter(i) as f from range(10000) t(i) group by g) fs on r.i % 7 = fs.g;
+----
+9000	1000
+
+# and against another group's filter it misses (up to false positives)
+query I
+select count(*) filter (where xor8_filter_contains(f, i)) < 100
+from range(10000) t(i) join (select i % 7 as g, xor8_filter(i) as f from range(10000) t(i) group by g) fs
+  on (i + 1) % 7 = fs.g;
+----
+true
