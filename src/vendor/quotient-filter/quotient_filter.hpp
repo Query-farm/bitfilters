@@ -41,7 +41,10 @@ public:
 	 * Inserts a hash into the QF.
 	 * Only the lowest q+r bits are actually inserted into the QF table.
 	 *
-	 * Returns false if the QF is full.
+	 * Returns false if the QF is full and does not already contain the hash.
+	 * A filter keeps at least one slot empty (a table with no empty slot has
+	 * no cluster boundaries, so lookups cannot terminate), so it holds at most
+	 * capacity() = 2^q - 1 entries.
 	 */
 	bool insert(uint64_t hash);
 
@@ -58,14 +61,30 @@ public:
 	bool may_contain(uint64_t hash) const;
 
 	/*
-	 * Initializes copies over all elements from another QuotientFilter.
+	 * Inserts every entry of `other` into this filter, in place.
+	 *
+	 * A filter only remembers the low q+r bits of each hash, so `other` must
+	 * carry at least as many fingerprint bits as this filter uses
+	 * (other.q + other.r >= q + r); merging from a filter with fewer bits would
+	 * store fingerprints that lookups can never match. Throws
+	 * InvalidInputException if that does not hold, or if this filter fills up.
 	 */
-	QuotientFilter merge(const QuotientFilter &other) const;
+	void merge_from(const QuotientFilter &other);
 
 	/*
 	 * Resets the QF table. This function does not deallocate any memory.
 	 */
 	void clear();
+
+	uint32_t q() const {
+		return values.qbits;
+	}
+	uint32_t r() const {
+		return values.rbits;
+	}
+	uint64_t capacity() const {
+		return values.max_size - 1;
+	}
 
 	/*
 	 * Finds the size (in bytes) of a QF table.

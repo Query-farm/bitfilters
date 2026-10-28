@@ -416,3 +416,19 @@ select count(*) filter (where binary_fuse8_filter_contains(f8, hash(i))) between
 from (select i from range(200000, 300000) t(i)) probes, fp_probe;
 ----
 true	true
+
+# Inputs where most values repeat: the construction used to give up on these
+# ("failed to construct a filter over 5000 values"); it now retries over the
+# distinct values.
+query II
+select count(*) filter (where binary_fuse8_filter_contains(f8, hash(i % 500))), count(*) filter (where binary_fuse16_filter_contains(f16, hash(i % 500)))
+from range(5000) t(i), (select binary_fuse8_filter(hash(i % 500)) as f8, binary_fuse16_filter(hash(i % 500)) as f16 from range(5000) t(i));
+----
+5000	5000
+
+# large enough for the up-front sample to see the repeats
+query I
+select count(*) filter (where binary_fuse8_filter_contains(f, hash(i % 1000)))
+from range(200000) t(i), (select binary_fuse8_filter(hash(i % 1000)) as f from range(200000) t(i));
+----
+200000

@@ -61,12 +61,13 @@ unique_ptr<FunctionData> QuotientFilterBind(ClientContext &context, AggregateFun
 	if (q.IsNull()) {
 		throw BinderException("Quotient filter q cannot be NULL");
 	}
-	// FIXME: should check the type
-	q.CastAs(context, LogicalType::UINTEGER);
-	auto actual_q = q.GetValue<uint32_t>();
-	if (actual_q == 0) {
-		throw BinderException("Quotient filter capacity must be greater than 0");
+	// The signature declares q and r as INTEGER, so the binder has already
+	// cast them; only the range is left to check.
+	const auto q_value = q.GetValue<int32_t>();
+	if (q_value <= 0 || q_value >= 64) {
+		throw BinderException("Quotient filter q must be between 1 and 63, got %d", q_value);
 	}
+	const auto actual_q = static_cast<uint32_t>(q_value);
 
 	if (arguments[1]->HasParameter()) {
 		throw ParameterNotResolvedException();
@@ -78,25 +79,30 @@ unique_ptr<FunctionData> QuotientFilterBind(ClientContext &context, AggregateFun
 	if (r.IsNull()) {
 		throw BinderException("Quotient filter r cannot be NULL");
 	}
-	// FIXME: should check the type
-	r.CastAs(context, LogicalType::UINTEGER);
-	auto actual_r = r.GetValue<uint32_t>();
-	if (actual_r == 0) {
-		throw BinderException("Quotient filter r must be greater than 0");
+	const auto r_value = r.GetValue<int32_t>();
+	if (r_value <= 0 || r_value >= 64) {
+		throw BinderException("Quotient filter r must be between 1 and 63, got %d", r_value);
 	}
+	const auto actual_r = static_cast<uint32_t>(r_value);
 	if (actual_r + actual_q > 64) {
-		throw BinderException("Quotient filter q+r must be between 0 and 64");
+		throw BinderException("Quotient filter q + r must be at most 64, got q = %u and r = %u", actual_q, actual_r);
 	}
 
 	// A filter this big can never be returned: DuckDB BLOBs top out at 4GB. Fail
 	// here rather than letting the aggregate allocate a table of that size and
-	// take the process down with it.
+	// take the process down with it. Any q >= 35 is over the limit (2^35 slots
+	// of at least 4 bits each); checking it first keeps the size computation
+	// from overflowing.
 	const uint64_t filter_bytes =
-	    sizeof(QuotientFilterValues) + (((1ULL << actual_q) * (uint64_t)(actual_r + 3)) + 7) / 8;
+	    actual_q >= 35 ? NumericLimits<uint64_t>::Maximum()
+	                   : sizeof(QuotientFilterValues) + (((1ULL << actual_q) * (uint64_t)(actual_r + 3)) + 7) / 8;
 	if (filter_bytes > NumericLimits<uint32_t>::Maximum()) {
-		throw BinderException("Quotient filter with q = %u and r = %u would need %llu bytes, which exceeds the maximum "
-		                      "BLOB size of %u bytes; use a smaller q",
-		                      actual_q, actual_r, filter_bytes, NumericLimits<uint32_t>::Maximum());
+		throw BinderException("Quotient filter with q = %u and r = %u would need %s, which exceeds the maximum BLOB "
+		                      "size of %u bytes; use a smaller q",
+		                      actual_q, actual_r,
+		                      actual_q >= 35 ? string("more than 16GB")
+		                                     : StringUtil::Format("%llu bytes", filter_bytes),
+		                      NumericLimits<uint32_t>::Maximum());
 	}
 
 	// So doing this causes problems.
@@ -158,7 +164,10 @@ struct QuotientFilterOperationBase {
 		if (!target.filter) {
 			target.CreateFilter(source);
 		} else {
-			*target.filter = target.filter->merge(*source.filter);
+			// Both states have the bound q and r, so this only fails if the
+			// union does not fit -- and then building the filter on one thread
+			// would have failed too.
+			target.filter->merge_from(*source.filter);
 		}
 	}
 };
@@ -175,15 +184,13 @@ struct QuotientFilterMergeOperation : QuotientFilterOperationBase {
 		// this is a filter in b_data, so we need to deserialize it. The
 		// constructor validates the BLOB and throws if it is not one of ours.
 		QuotientFilter incoming(a_data.GetData(), a_data.GetSize());
-		*state.filter = state.filter->merge(incoming);
+		state.filter->merge_from(incoming);
 	}
 
+	// A filter is a set: the same input repeated adds nothing after the first.
 	template <class INPUT_TYPE, class STATE, class OP>
-	static void ConstantOperation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input,
-	                              idx_t count) {
-		for (idx_t i = 0; i < count; i++) {
-			Operation<INPUT_TYPE, STATE, OP>(state, input, unary_input);
-		}
+	static void ConstantOperation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input, idx_t) {
+		Operation<INPUT_TYPE, STATE, OP>(state, input, unary_input);
 	}
 
 	template <class STATE, class OP>
@@ -211,18 +218,16 @@ struct QuotientFilterCreateOperation : QuotientFilterOperationBase {
 		}
 		auto result = state.filter->insert(a_data);
 		if (!result) {
-			throw InvalidInputException(
-			    "quotient_filter: the filter is full (q = %u gives it %llu slots); increase q to hold more values",
-			    bind_data.q, 1ULL << bind_data.q);
+			throw InvalidInputException("quotient_filter: the filter is full (q = %u holds at most %llu values); "
+			                            "increase q to hold more values",
+			                            bind_data.q, state.filter->capacity());
 		}
 	}
 
+	// A filter is a set: the same input repeated adds nothing after the first.
 	template <class INPUT_TYPE, class STATE, class OP>
-	static void ConstantOperation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input,
-	                              idx_t count) {
-		for (idx_t i = 0; i < count; i++) {
-			Operation<INPUT_TYPE, STATE, OP>(state, input, unary_input);
-		}
+	static void ConstantOperation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input, idx_t) {
+		Operation<INPUT_TYPE, STATE, OP>(state, input, unary_input);
 	}
 
 	template <class STATE, class OP>
@@ -355,9 +360,10 @@ void LoadQuotientFilter(ExtensionLoader &loader) {
 			// only attaches a description whose parameter_types match the overload.
 			FunctionDescription desc;
 			desc.description = "Merges Quotient filters (BLOBs produced by quotient_filter) into a single filter "
-			                   "containing every value of the inputs. q and r size the merged filter; it uses the "
-			                   "larger of these and each input's quotient and remainder bits, so q must leave room "
-			                   "for all merged values. q + r must be <= 64.";
+			                   "containing every value of the inputs. q and r size the merged filter, which holds at "
+			                   "most 2^q - 1 values. Each input must keep at least q + r bits of each hash (its own "
+			                   "q + r must be >= q + r), so a merge can grow q only by giving up as many remainder "
+			                   "bits. q + r must be <= 64.";
 			desc.parameter_names = {"q", "r", "filter"};
 			desc.parameter_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BLOB};
 			desc.examples.push_back("SELECT quotient_filter(16, 8, filter) FROM filters");

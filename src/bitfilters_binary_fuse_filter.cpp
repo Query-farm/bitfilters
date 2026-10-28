@@ -6,6 +6,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
+#include "bitfilters_dedupe.hpp"
 #include "vendor/fastfilter/binaryfusefilter.h"
 
 namespace duckdb {
@@ -285,7 +286,10 @@ struct BinaryFuseFilterCreateOperation {
 			                          Traits::Name(), static_cast<uint64_t>(entries.size()),
 			                          NumericLimits<uint32_t>::Maximum());
 		}
-		const auto count = static_cast<uint32_t>(entries.size());
+		auto count = static_cast<uint32_t>(entries.size());
+		if (BitfiltersLooksRepetitive(entries.data(), count)) {
+			count = static_cast<uint32_t>(BitfiltersSortUnique(entries.data(), count));
+		}
 
 		FilterType filter;
 		if (!Traits::Allocate(count, &filter)) {
@@ -293,14 +297,23 @@ struct BinaryFuseFilterCreateOperation {
 		}
 		BinaryFuseFilterGuard<FilterType> guard(filter);
 
-		// Populate rewrites `entries` in place (it sorts and de-duplicates the
-		// keys when it detects duplicates), which is fine -- the state is dead
-		// once we have finalized it.
 		if (!Traits::Populate(entries.data(), count, &filter)) {
-			throw InvalidInputException(
-			    "%s_filter: failed to construct a filter over %u values. This is usually caused by running out of "
-			    "memory, or by an input distribution the construction algorithm could not resolve.",
-			    Traits::Name(), count);
+			// The construction can give up on inputs with many repeated keys.
+			// Retry once over the distinct keys. A failed attempt only sorts
+			// and compacts the first `count` keys in place, so they still hold
+			// every key.
+			count = static_cast<uint32_t>(BitfiltersSortUnique(entries.data(), count));
+			Traits::Free(&filter);
+			if (!Traits::Allocate(count, &filter)) {
+				throw OutOfMemoryException("%s_filter: failed to allocate a filter for %u values", Traits::Name(),
+				                           count);
+			}
+			if (!Traits::Populate(entries.data(), count, &filter)) {
+				throw InvalidInputException(
+				    "%s_filter: failed to construct a filter over %u values. This is usually caused by running out of "
+				    "memory, or by an input distribution the construction algorithm could not resolve.",
+				    Traits::Name(), count);
+			}
 		}
 
 		const auto exact_size = BinaryFuseExactSerializedSize<FilterType>(filter.ArrayLength);

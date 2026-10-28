@@ -161,12 +161,20 @@ static void QuotientFilterScanStep(uint64_t &steps, uint64_t limit) {
 
 inline uint64_t QuotientFilter::find_run_index(uint64_t fq) const {
 	const uint64_t limit = this->values.max_size;
-	uint64_t steps = 0;
+
+	/*
+	 * Each cursor gets its own budget: in a nearly full table the walk back to
+	 * the cluster start and the walks forward from it can each cover almost
+	 * the whole table, so a single shared budget trips on valid filters.
+	 */
+	uint64_t back_steps = 0;
+	uint64_t s_steps = 0;
+	uint64_t b_steps = 0;
 
 	/* Find the start of the cluster. */
 	uint64_t b = fq;
 	while (is_shifted(this->get_elem(b))) {
-		QuotientFilterScanStep(steps, limit);
+		QuotientFilterScanStep(back_steps, limit);
 		b = decr(b);
 	}
 
@@ -174,12 +182,12 @@ inline uint64_t QuotientFilter::find_run_index(uint64_t fq) const {
 	uint64_t s = b;
 	while (b != fq) {
 		do {
-			QuotientFilterScanStep(steps, limit);
+			QuotientFilterScanStep(s_steps, limit);
 			s = incr(s);
 		} while (is_continuation(this->get_elem(s)));
 
 		do {
-			QuotientFilterScanStep(steps, limit);
+			QuotientFilterScanStep(b_steps, limit);
 			b = incr(b);
 		} while (!is_occupied(this->get_elem(b)));
 	}
@@ -191,8 +199,10 @@ void QuotientFilter::insert_into(uint64_t s, uint64_t elt) {
 	uint64_t prev;
 	uint64_t curr = elt;
 	bool empty;
+	uint64_t steps = 0;
 
 	do {
+		QuotientFilterScanStep(steps, this->values.max_size);
 		prev = this->get_elem(s);
 		empty = is_empty_element(prev);
 		if (!empty) {
@@ -210,8 +220,10 @@ void QuotientFilter::insert_into(uint64_t s, uint64_t elt) {
 }
 
 bool QuotientFilter::insert(uint64_t hash) {
-	if (this->values.entries >= this->values.max_size) {
-		return false;
+	if (this->values.entries >= this->capacity()) {
+		// Full -- unless the hash is already present, in which case inserting
+		// it again is a no-op and succeeds like any other duplicate insert.
+		return this->may_contain(hash);
 	}
 
 	uint64_t fq = this->hash_to_quotient(hash);
@@ -397,24 +409,32 @@ bool QuotientFilter::remove(uint64_t hash) {
 	return true;
 }
 
-QuotientFilter QuotientFilter::merge(const QuotientFilter &other) const {
-	// I don't think we should increase q here, since we are merging two filters
-	// with the same q. If we increase q, we might end up with a filter
-
-	//	uint32_t q = 1 + MAX(this->qbits, other.qbits);
-	uint32_t q = MAX(this->values.qbits, other.values.qbits);
-	uint32_t r = MAX(this->values.rbits, other.values.rbits);
-	QuotientFilter out(q, r);
-
-	QuotientFilterIterator qfi(*this);
-	while (!qfi.done()) {
-		out.insert(qfi.next());
+void QuotientFilter::merge_from(const QuotientFilter &other) {
+	// Each entry of `other` comes back as its low other.q + other.r hash bits.
+	// This filter keys on its own low q + r bits, so it can only rebuild them
+	// if `other` kept at least that many; otherwise the missing high bits
+	// would be stored as zero and lookups of the real hash would miss.
+	const uint32_t needed_bits = this->values.qbits + this->values.rbits;
+	const uint32_t other_bits = other.values.qbits + other.values.rbits;
+	if (other_bits < needed_bits) {
+		throw duckdb::InvalidInputException(
+		    "quotient_filter: cannot merge a filter with q = %u, r = %u into one with q = %u, r = %u: the input keeps "
+		    "%u bits of each hash but the result needs %u. Merge into a filter with q + r <= %u (for example q = %u, "
+		    "r = %u), or rebuild it from the original values.",
+		    (uint32_t)other.values.qbits, (uint32_t)other.values.rbits, (uint32_t)this->values.qbits,
+		    (uint32_t)this->values.rbits, other_bits, needed_bits, other_bits, (uint32_t)this->values.qbits,
+		    other_bits > this->values.qbits ? other_bits - this->values.qbits : 0);
 	}
-	QuotientFilterIterator qfi2(other);
-	while (!qfi2.done()) {
-		out.insert(qfi2.next());
+
+	QuotientFilterIterator it(other);
+	while (!it.done()) {
+		if (!this->insert(it.next())) {
+			throw duckdb::InvalidInputException(
+			    "quotient_filter: the merged filter is full (q = %u holds at most %llu values); increase q to hold "
+			    "more values",
+			    (uint32_t)this->values.qbits, (unsigned long long)this->capacity());
+		}
 	}
-	return out;
 }
 
 void QuotientFilter::clear() {
