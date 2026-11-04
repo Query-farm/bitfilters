@@ -9,3 +9,15 @@ or
 ```bash
 make test_debug
 ```
+
+`sql/duplicate_sampling.test` checks that periodic keys and consecutive runs
+of duplicates produce filters as compact as explicit `DISTINCT`, for both
+fingerprint widths of XOR and Binary Fuse. It also checks membership, unique
+inputs around the sampling threshold, and repeated window finalization.
+
+Duplicate detection hashes sample positions, sorts and deduplicates those
+positions, then checks the sampled keys for repetition. The sample uses a
+bounded 32 KiB buffer. Sampling remains a heuristic; detected duplicates use
+the existing full-input sort/unique path, which can cost build time and
+workspace in exchange for a smaller stored filter. Input collection and BLOB
+formats are unchanged.

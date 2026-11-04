@@ -7,6 +7,7 @@
 #include "bitfilters_memory.hpp"
 #include "bitfilters_format.hpp"
 #include "duckdb/common/types/list_segment.hpp"
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/function/aggregate_state_layout.hpp"
 
 #include <algorithm>
@@ -215,25 +216,31 @@ struct BitfiltersKeyCollectOperation {
 		}
 	}
 
-	// Whether `keys` looks like it repeats values a lot, judged from a sample
-	// of evenly spaced keys. Keys are hashes, so distinct values almost never
-	// collide and any repeats in the sample mean repeated input values.
+	// Whether `keys` looks like it repeats values a lot. A fixed stride can
+	// miss repetition in periodic input or in runs of equal keys, so choose
+	// positions with a deterministic hash instead. This remains a heuristic,
+	// not a guarantee of deduplication.
 	static bool LooksRepetitive(const uint64_t *keys, idx_t count) {
 		constexpr idx_t SAMPLE = 4096;
 		if (count < 2 * SAMPLE) {
 			return false;
 		}
 		uint64_t sample[SAMPLE];
-		const auto stride = count / SAMPLE;
 		for (idx_t i = 0; i < SAMPLE; i++) {
-			sample[i] = keys[i * stride];
+			sample[i] = Hash<uint64_t>(i) % count;
 		}
-		std::sort(sample, sample + SAMPLE);
+		// Visit positions in order, once each: resampling the same row must
+		// not count as duplicate input. Reuse the position buffer for keys.
+		const auto sample_count = SortUnique(sample, SAMPLE);
+		for (idx_t i = 0; i < sample_count; i++) {
+			sample[i] = keys[sample[i]];
+		}
+		std::sort(sample, sample + sample_count);
 		idx_t repeats = 0;
-		for (idx_t i = 1; i < SAMPLE; i++) {
+		for (idx_t i = 1; i < sample_count; i++) {
 			repeats += sample[i] == sample[i - 1];
 		}
-		return repeats > SAMPLE / 100;
+		return repeats > sample_count / 100;
 	}
 
 	// Sorts `keys` and drops repeats; returns how many distinct keys remain.

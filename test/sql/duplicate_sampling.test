@@ -1,0 +1,82 @@
+# name: test/sql/duplicate_sampling.test
+# description: duplicate sampling avoids oversized filters on periodic input
+# group: [sql]
+
+require bitfilters
+
+statement ok
+set threads = 1;
+
+statement ok
+set memory_limit = '64MB';
+
+# The old sample visits 4096 different keys in both periodic input and runs
+# of 100 equal keys. Binary Fuse can successfully build these inputs without
+# deduplicating, sizing for 819200 keys instead of 8191/8192. Check output size
+# as well as membership: construction success alone does not catch the bug.
+foreach expression i%8191 i//100
+
+statement ok
+create or replace table repetitive_keys as
+select hash({expression}) as k from range(819200) t(i);
+
+foreach filter xor8 xor16 binary_fuse8 binary_fuse16
+
+statement ok
+create or replace table compact_filter as
+select {filter}_filter(k) as f, {filter}_filter(distinct k) as d from repetitive_keys;
+
+query I
+select octet_length(f) = octet_length(d) from compact_filter;
+----
+true
+
+query I
+select count(*) from (select distinct k from repetitive_keys), compact_filter
+where not {filter}_filter_contains(f, k);
+----
+0
+
+endloop
+
+endloop
+
+# Sampled deduplication during repeated window finalization must leave the
+# underlying state intact as frames grow across the sampling threshold.
+statement ok
+set memory_limit = '512MB';
+
+foreach filter xor16 binary_fuse16
+
+query I
+select count(*) from (
+  select i, {filter}_filter(hash(i % 1000)) over (
+    order by i rows between 8191 preceding and current row) as f
+  from range(8200) t(i)
+) where not {filter}_filter_contains(f, hash(i % 1000))
+     or not {filter}_filter_contains(f, hash(greatest(0, i - 8191) % 1000))
+     or (i >= 8191 and octet_length(f) > 4096);
+----
+0
+
+endloop
+
+# Unique inputs on either side of the sampling threshold and a non-divisible
+# count must not lose any keys or accidentally sample a row twice.
+statement ok
+set memory_limit = '64MB';
+
+foreach count 8191 8192 8193
+
+foreach filter xor8 xor16 binary_fuse8 binary_fuse16
+
+query I
+select count(*) from range({count}) t(i),
+  (select {filter}_filter(hash(i)) as f from range({count}) t(i))
+where not {filter}_filter_contains(f, hash(i));
+----
+0
+
+endloop
+
+endloop
