@@ -102,6 +102,13 @@ select count(*) from duckdb_memory() where tag = 'ALLOCATOR' and memory_usage_by
 statement ok
 set temp_directory = '{TEST_DIR}/spill';
 
+# One thread: DuckDB v2.0.1 runs this range pipeline on every thread
+# (duckdb/duckdb#27767), and four thread-local hash aggregates need more fixed
+# 16MiB allocations than fit in 64MB before anything can spill. v2.0.0 ran it
+# on one thread, so this keeps the test measuring spilling, not thread count.
+statement ok
+set threads = 1;
+
 statement ok
 set memory_limit = '64MB';
 
@@ -112,6 +119,9 @@ create or replace table spilled_filters as
 
 statement ok
 set memory_limit = '2GB';
+
+statement ok
+set threads = 4;
 
 query III
 select count(distinct g),
