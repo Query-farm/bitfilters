@@ -102,31 +102,25 @@ select count(*) from duckdb_memory() where tag = 'ALLOCATOR' and memory_usage_by
 statement ok
 set temp_directory = '{TEST_DIR}/spill';
 
-# One thread: DuckDB v2.0.1 runs this range pipeline on every thread
-# (duckdb/duckdb#27767), and four thread-local hash aggregates need more fixed
-# 16MiB allocations than fit in 64MB before anything can spill. v2.0.0 ran it
-# on one thread, so this keeps the test measuring spilling, not thread count.
-statement ok
-set threads = 1;
-
+# 10000 groups: DuckDB v2.0.1 does not spill a hash aggregate over a few
+# integer keys (1000 groups of plain list() fail at 64MB, without spilling,
+# where v2.0.0 spills them), so fewer groups would test DuckDB rather than
+# these states. Unlimited, this build peaks near twice the limit.
 statement ok
 set memory_limit = '64MB';
 
 statement ok
 create or replace table spilled_filters as
   select g, xor8_filter(hash(i)) as x, binary_fuse8_filter(hash(i)) as b
-  from range(4000000) t(i), (select i % 1000 as g) group by g;
+  from range(4000000) t(i), (select i % 10000 as g) group by g;
 
 statement ok
 set memory_limit = '2GB';
-
-statement ok
-set threads = 4;
 
 query III
 select count(distinct g),
        count(*) filter (where not xor8_filter_contains(x, hash(i))),
        count(*) filter (where not binary_fuse8_filter_contains(b, hash(i)))
-from range(4000000) t(i) join spilled_filters on i % 1000 = g;
+from range(4000000) t(i) join spilled_filters on i % 10000 = g;
 ----
-1000	0	0
+10000	0	0
