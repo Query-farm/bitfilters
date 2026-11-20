@@ -103,9 +103,10 @@ statement ok
 set temp_directory = '{TEST_DIR}/spill';
 
 # 10000 groups: DuckDB v2.0.1 does not spill a hash aggregate over a few
-# integer keys (1000 groups of plain list() fail at 64MB, without spilling,
-# where v2.0.0 spills them), so fewer groups would test DuckDB rather than
-# these states. Unlimited, this build peaks near twice the limit.
+# integer keys (duckdb/duckdb#29163: 1000 groups of plain list() run out of
+# memory at 64MB without spilling, where v2.0.0 completes), so fewer groups
+# would test DuckDB rather than these states. Unlimited, this query peaks
+# near twice the limit.
 statement ok
 set memory_limit = '64MB';
 
